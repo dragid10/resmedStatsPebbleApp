@@ -45,7 +45,12 @@
       "Logout",
       "FRESH_INSTALL",
       "COLORBLIND_MODE",
-      "SYNC_INTERVAL"
+      "SYNC_INTERVAL",
+      "SHOW_EVENTS",
+      "SHOW_USAGE",
+      "SHOW_MASK_OFF",
+      "SHOW_LEAK",
+      "TEXT_INDICATORS"
     ],
     "resources": {
       "media": [

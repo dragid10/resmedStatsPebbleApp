@@ -723,6 +723,12 @@ Pebble.addEventListener('showConfiguration', function () {
     // Load current settings from localStorage
     var currentColorblind = localStorage.getItem('setting_colorblind') === 'true';
     var currentSyncInterval = localStorage.getItem('setting_sync_interval') || '4';
+    // Stat visibility (default all on)
+    var showEvents = localStorage.getItem('setting_show_events') !== 'false';
+    var showUsage = localStorage.getItem('setting_show_usage') !== 'false';
+    var showMaskOff = localStorage.getItem('setting_show_mask_off') !== 'false';
+    var showLeak = localStorage.getItem('setting_show_leak') !== 'false';
+    var textIndicators = localStorage.getItem('setting_text_indicators') === 'true';
 
     var connectedPage = '<!DOCTYPE html><html><head>' +
       '<meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -767,9 +773,16 @@ Pebble.addEventListener('showConfiguration', function () {
 
       '<div class="setting-row">' +
       '<div><div class="setting-label">Colorblind Mode</div>' +
-      '<div class="setting-desc">Use patterns instead of red/yellow/green</div></div>' +
+      '<div class="setting-desc">Use blue/orange instead of red/green</div></div>' +
       '<label class="toggle"><input type="checkbox" id="colorblind"' +
       (currentColorblind ? ' checked' : '') + '><span class="slider"></span></label>' +
+      '</div>' +
+
+      '<div class="setting-row">' +
+      '<div><div class="setting-label">Simple Mode</div>' +
+      '<div class="setting-desc">Show Good/OK/Poor instead of numbers</div></div>' +
+      '<label class="toggle"><input type="checkbox" id="text-indicators"' +
+      (textIndicators ? ' checked' : '') + '><span class="slider"></span></label>' +
       '</div>' +
 
       '<div class="setting-row">' +
@@ -785,6 +798,33 @@ Pebble.addEventListener('showConfiguration', function () {
 
       '</div>' +
 
+      // -- Visible Stats card --
+      '<div class="card">' +
+      '<h3>Visible Stats</h3>' +
+      '<div class="setting-desc" style="margin-bottom:12px;">Overall score is always shown. Choose which details to display below it.</div>' +
+
+      '<div class="setting-row">' +
+      '<div class="setting-label">Events (AHI)</div>' +
+      '<label class="toggle"><input type="checkbox" id="show-events"' +
+      (showEvents ? ' checked' : '') + '><span class="slider"></span></label></div>' +
+
+      '<div class="setting-row">' +
+      '<div class="setting-label">Usage</div>' +
+      '<label class="toggle"><input type="checkbox" id="show-usage"' +
+      (showUsage ? ' checked' : '') + '><span class="slider"></span></label></div>' +
+
+      '<div class="setting-row">' +
+      '<div class="setting-label">Mask Off</div>' +
+      '<label class="toggle"><input type="checkbox" id="show-mask-off"' +
+      (showMaskOff ? ' checked' : '') + '><span class="slider"></span></label></div>' +
+
+      '<div class="setting-row">' +
+      '<div class="setting-label">Leak</div>' +
+      '<label class="toggle"><input type="checkbox" id="show-leak"' +
+      (showLeak ? ' checked' : '') + '><span class="slider"></span></label></div>' +
+
+      '</div>' +
+
       // -- Buttons --
       '<button class="btn btn-save" onclick="saveSettings()">Save Settings</button>' +
       '<button class="btn btn-danger" onclick="disconnect()">Disconnect Account</button>' +
@@ -792,9 +832,15 @@ Pebble.addEventListener('showConfiguration', function () {
       '<script>' +
       'function saveSettings(){' +
       'var cb=document.getElementById("colorblind").checked;' +
+      'var ti=document.getElementById("text-indicators").checked;' +
       'var si=document.getElementById("sync-interval").value;' +
+      'var se=document.getElementById("show-events").checked;' +
+      'var su=document.getElementById("show-usage").checked;' +
+      'var sm=document.getElementById("show-mask-off").checked;' +
+      'var sl=document.getElementById("show-leak").checked;' +
       'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({' +
-      'COLORBLIND_MODE:cb,SYNC_INTERVAL:parseInt(si)}));' +
+      'COLORBLIND_MODE:cb,TEXT_INDICATORS:ti,SYNC_INTERVAL:parseInt(si),' +
+      'SHOW_EVENTS:se,SHOW_USAGE:su,SHOW_MASK_OFF:sm,SHOW_LEAK:sl}));' +
       '}' +
       'function disconnect(){' +
       'if(confirm("Disconnect your ResMed account? Your credentials will be removed.")){' +
@@ -845,14 +891,33 @@ Pebble.addEventListener('webviewclosed', function (event) {
       var colorblind = parsed.COLORBLIND_MODE === true ? 1 : 0;
       var syncHours = parsed.SYNC_INTERVAL || 4;
 
-      // Persist settings locally
-      localStorage.setItem('setting_colorblind', '' + (colorblind === 1));
-      localStorage.setItem('setting_sync_interval', '' + syncHours);
+      // Text indicators
+      var textIndicators = parsed.TEXT_INDICATORS === true ? 1 : 0;
 
-      // Send settings to the watch
+      // Stat visibility
+      var showEvents = parsed.SHOW_EVENTS === true ? 1 : 0;
+      var showUsage = parsed.SHOW_USAGE === true ? 1 : 0;
+      var showMaskOff = parsed.SHOW_MASK_OFF === true ? 1 : 0;
+      var showLeak = parsed.SHOW_LEAK === true ? 1 : 0;
+
+      // Persist all settings locally
+      localStorage.setItem('setting_colorblind', '' + (colorblind === 1));
+      localStorage.setItem('setting_text_indicators', '' + (textIndicators === 1));
+      localStorage.setItem('setting_sync_interval', '' + syncHours);
+      localStorage.setItem('setting_show_events', '' + (showEvents === 1));
+      localStorage.setItem('setting_show_usage', '' + (showUsage === 1));
+      localStorage.setItem('setting_show_mask_off', '' + (showMaskOff === 1));
+      localStorage.setItem('setting_show_leak', '' + (showLeak === 1));
+
+      // Send all settings to the watch in one message
       Pebble.sendAppMessage({
         'COLORBLIND_MODE': colorblind,
-        'SYNC_INTERVAL': syncHours
+        'TEXT_INDICATORS': textIndicators,
+        'SYNC_INTERVAL': syncHours,
+        'SHOW_EVENTS': showEvents,
+        'SHOW_USAGE': showUsage,
+        'SHOW_MASK_OFF': showMaskOff,
+        'SHOW_LEAK': showLeak
       },
         function () { console.log('Settings sent to watch'); },
         function () { console.log('Failed to send settings to watch'); }

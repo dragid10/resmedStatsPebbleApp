@@ -62,6 +62,15 @@
 /** Key for storing sync interval in hours. */
 #define PERSIST_KEY_SYNC_INTERVAL 5
 
+/** Key for storing visible stats bitmask. */
+#define PERSIST_KEY_VISIBLE_STATS 6
+
+/** Key for storing the last sync epoch (unix timestamp). */
+#define PERSIST_KEY_SYNC_EPOCH 7
+
+/** Key for storing the text indicators setting (0=off, 1=on). */
+#define PERSIST_KEY_TEXT_INDICATORS 8
+
 // -- AppMessage Buffer Sizes --
 
 /** Inbox buffer size — must fit one day's data (~70 bytes) with headroom. */
@@ -119,6 +128,14 @@
 #define USAGE_GOOD_THRESHOLD_MINS 420
 #define USAGE_OK_THRESHOLD_MINS   240
 
+/** Mask off: 0-1 removals is good, 2-3 is okay, 4+ is high. */
+#define MASK_GOOD_THRESHOLD 2
+#define MASK_OK_THRESHOLD   4
+
+/** Leak: <20% is good, 20-40% is okay, >40% is high. */
+#define LEAK_GOOD_THRESHOLD 20
+#define LEAK_OK_THRESHOLD   40
+
 // ---------------------------------------------------------------------------
 // Data Structures
 // ---------------------------------------------------------------------------
@@ -166,8 +183,15 @@ static int s_loading_dot_count = 0;      // Current number of dots (0-2)
 static AppTimer *s_loading_anim_timer = NULL;
 
 // -- Settings --
-static bool s_colorblind_mode = false;         // Use high-contrast indicators instead of colors
+static bool s_colorblind_mode = false;         // Swap color palette for colorblind users
+static bool s_text_indicators = false;         // Replace values with "Good"/"OK"/"Poor" text
 static int s_sync_interval_hours = 4;          // Hours between automatic syncs
+
+// Stat visibility flags (all default to visible)
+static bool s_show_events = true;
+static bool s_show_usage = true;
+static bool s_show_mask_off = true;
+static bool s_show_leak = true;
 
 // -- Sync Timing --
 static WakeupId s_wakeup_id = -1;
@@ -178,10 +202,7 @@ static time_t s_last_sync_epoch = 0;           // Unix timestamp of last success
 // Color Helpers — Map clinical values to color-coded indicators
 // ---------------------------------------------------------------------------
 
-/**
- * Returns green/yellow/red based on the myAir sleep score.
- * In colorblind mode, returns white (text indicators are used instead).
- */
+/** Returns color-coded indicator for the myAir sleep score. */
 static GColor get_score_color(int score) {
     if (s_colorblind_mode) return COLOR_VALUE;
     if (score >= SCORE_GOOD_THRESHOLD) return COLOR_SCORE_GOOD;
@@ -189,10 +210,7 @@ static GColor get_score_color(int score) {
     return COLOR_SCORE_BAD;
 }
 
-/**
- * Returns green/yellow/red based on AHI value (×10 to avoid floats).
- * In colorblind mode, returns white.
- */
+/** Returns color-coded indicator for the AHI value (×10). */
 static GColor get_ahi_color(int ahi_x10) {
     if (s_colorblind_mode) return COLOR_VALUE;
     if (ahi_x10 < AHI_NORMAL_THRESHOLD_X10) return COLOR_SCORE_GOOD;
@@ -200,10 +218,7 @@ static GColor get_ahi_color(int ahi_x10) {
     return COLOR_SCORE_BAD;
 }
 
-/**
- * Returns green/yellow/red based on CPAP usage duration in minutes.
- * In colorblind mode, returns white.
- */
+/** Returns color-coded indicator for CPAP usage duration. */
 static GColor get_usage_color(int usage_mins) {
     if (s_colorblind_mode) return COLOR_VALUE;
     if (usage_mins >= USAGE_GOOD_THRESHOLD_MINS) return COLOR_SCORE_GOOD;
@@ -235,9 +250,23 @@ static void persist_load_records(void) {
     if (persist_exists(PERSIST_KEY_COLORBLIND)) {
         s_colorblind_mode = persist_read_bool(PERSIST_KEY_COLORBLIND);
     }
+    if (persist_exists(PERSIST_KEY_TEXT_INDICATORS)) {
+        s_text_indicators = persist_read_bool(PERSIST_KEY_TEXT_INDICATORS);
+    }
     if (persist_exists(PERSIST_KEY_SYNC_INTERVAL)) {
         s_sync_interval_hours = persist_read_int(PERSIST_KEY_SYNC_INTERVAL);
         if (s_sync_interval_hours < 4) s_sync_interval_hours = 4;
+    }
+    if (persist_exists(PERSIST_KEY_SYNC_EPOCH)) {
+        s_last_sync_epoch = (time_t)persist_read_int(PERSIST_KEY_SYNC_EPOCH);
+    }
+    if (persist_exists(PERSIST_KEY_VISIBLE_STATS)) {
+        // Bitmask: bit 0=events, 1=usage, 2=mask_off, 3=leak
+        int mask = persist_read_int(PERSIST_KEY_VISIBLE_STATS);
+        s_show_events  = (mask & 1) != 0;
+        s_show_usage   = (mask & 2) != 0;
+        s_show_mask_off = (mask & 4) != 0;
+        s_show_leak    = (mask & 8) != 0;
     }
 }
 
@@ -282,6 +311,41 @@ static void send_data_request(void) {
 // ---------------------------------------------------------------------------
 // All positions are computed from screen bounds so the layout adapts
 // to any Pebble screen size (144x168 through 200x228).
+
+// -- Text indicators --
+// When enabled, these REPLACE numeric values with human-readable
+// interpretations like "Good", "OK", "Poor" — for users who don't
+// care about the exact numbers.
+
+static const char* get_score_text(int score) {
+    if (score >= SCORE_GOOD_THRESHOLD) return "Good";
+    if (score >= SCORE_OK_THRESHOLD) return "OK";
+    return "Poor";
+}
+
+static const char* get_ahi_text(int ahi_x10) {
+    if (ahi_x10 < AHI_NORMAL_THRESHOLD_X10) return "Good";
+    if (ahi_x10 < AHI_MILD_THRESHOLD_X10) return "Mild";
+    return "High";
+}
+
+static const char* get_usage_text(int usage_mins) {
+    if (usage_mins >= USAGE_GOOD_THRESHOLD_MINS) return "Good";
+    if (usage_mins >= USAGE_OK_THRESHOLD_MINS) return "OK";
+    return "Low";
+}
+
+static const char* get_mask_text(int mask_count) {
+    if (mask_count < MASK_GOOD_THRESHOLD) return "Good";
+    if (mask_count < MASK_OK_THRESHOLD) return "OK";
+    return "High";
+}
+
+static const char* get_leak_text(int leak_pct) {
+    if (leak_pct < LEAK_GOOD_THRESHOLD) return "Good";
+    if (leak_pct < LEAK_OK_THRESHOLD) return "OK";
+    return "High";
+}
 
 /** Draw the header bar with date and day counter. */
 static void draw_header(GContext *ctx, GRect bounds, SleepRecord *record) {
@@ -334,15 +398,18 @@ static void draw_score_hero(GContext *ctx, GRect bounds, SleepRecord *record) {
 
     graphics_context_set_text_color(ctx, get_score_color(record->sleep_score));
     graphics_draw_text(ctx, score_num,
-        fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD),
-        GRect(0, score_y, W, 46),
+        fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
+        GRect(0, score_y, W, 40),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-    // "myAir Score" label below the number
+    // Score label — show "myAir Score" or the text interpretation
+    const char *score_label = s_text_indicators ?
+        get_score_text(record->sleep_score) : "myAir Score";
+
     graphics_context_set_text_color(ctx, COLOR_LABEL);
-    graphics_draw_text(ctx, "myAir Score",
+    graphics_draw_text(ctx, score_label,
         fonts_get_system_font(FONT_KEY_GOTHIC_14),
-        GRect(0, score_y + 42, W, 16),
+        GRect(0, score_y + 38, W, 16),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
@@ -369,43 +436,73 @@ static void draw_stat_row(GContext *ctx, int y, int W,
         GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
 }
 
-/** Draw the stats section below the score. */
+/** Draw the stats section — only renders user-selected stats. */
 static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
     if (!record || !record->has_data) return;
 
     int W = bounds.size.w;
     int H = bounds.size.h;
     int footer_h = 18;
-    // Calculate row height to fill space between score label and footer
-    // Start stats at ~51% of screen height (below score + label)
+
+    // Count visible stats to distribute vertical space evenly
+    int visible_count = 0;
+    if (s_show_events) visible_count++;
+    if (s_show_usage) visible_count++;
+    if (s_show_mask_off) visible_count++;
+    if (s_show_leak) visible_count++;
+
+    if (visible_count == 0) return;
+
     int stats_top = H * 51 / 100;
     int stats_bottom = H - footer_h - 2;
-    int available = stats_bottom - stats_top;
-    int row_h = available / 4;
+    int row_h = (stats_bottom - stats_top) / visible_count;
 
-    // Thin divider line above stats
+    // Divider line
     graphics_context_set_stroke_color(ctx, COLOR_CARD_BORDER);
     graphics_draw_line(ctx, GPoint(6, stats_top - 3), GPoint(W - 6, stats_top - 3));
 
-    // Format values
+    // Format values — text indicators replace numbers when enabled
     static char ahi_text[12];
-    snprintf(ahi_text, sizeof(ahi_text), "%d.%d /hr",
-             record->ahi_x10 / 10, record->ahi_x10 % 10);
-
     static char usage_text[12];
-    snprintf(usage_text, sizeof(usage_text), "%dh %02dm",
-             record->usage_mins / 60, record->usage_mins % 60);
-
     static char mask_text[8];
-    snprintf(mask_text, sizeof(mask_text), "%d", record->mask_count);
-
     static char leak_text[8];
-    snprintf(leak_text, sizeof(leak_text), "%d%%", record->leak_pct);
 
-    draw_stat_row(ctx, stats_top, W, "Events", ahi_text, get_ahi_color(record->ahi_x10));
-    draw_stat_row(ctx, stats_top + row_h, W, "Usage", usage_text, get_usage_color(record->usage_mins));
-    draw_stat_row(ctx, stats_top + row_h * 2, W, "Mask Off", mask_text, COLOR_VALUE);
-    draw_stat_row(ctx, stats_top + row_h * 3, W, "Leak", leak_text, COLOR_VALUE);
+    if (s_text_indicators) {
+        snprintf(ahi_text, sizeof(ahi_text), "%s", get_ahi_text(record->ahi_x10));
+        snprintf(usage_text, sizeof(usage_text), "%s", get_usage_text(record->usage_mins));
+        snprintf(mask_text, sizeof(mask_text), "%s", get_mask_text(record->mask_count));
+        snprintf(leak_text, sizeof(leak_text), "%s", get_leak_text(record->leak_pct));
+    } else {
+        snprintf(ahi_text, sizeof(ahi_text), "%d.%d /hr",
+                 record->ahi_x10 / 10, record->ahi_x10 % 10);
+        snprintf(usage_text, sizeof(usage_text), "%dh %02dm",
+                 record->usage_mins / 60, record->usage_mins % 60);
+        snprintf(mask_text, sizeof(mask_text), "%d", record->mask_count);
+        snprintf(leak_text, sizeof(leak_text), "%d%%", record->leak_pct);
+    }
+
+    // Draw only user-selected stats, stacked dynamically
+    int row = 0;
+    if (s_show_events) {
+        draw_stat_row(ctx, stats_top + row_h * row, W,
+                      "Events", ahi_text, get_ahi_color(record->ahi_x10));
+        row++;
+    }
+    if (s_show_usage) {
+        draw_stat_row(ctx, stats_top + row_h * row, W,
+                      "Usage", usage_text, get_usage_color(record->usage_mins));
+        row++;
+    }
+    if (s_show_mask_off) {
+        draw_stat_row(ctx, stats_top + row_h * row, W,
+                      "Mask Off", mask_text, COLOR_VALUE);
+        row++;
+    }
+    if (s_show_leak) {
+        draw_stat_row(ctx, stats_top + row_h * row, W,
+                      "Leak", leak_text, COLOR_VALUE);
+        row++;
+    }
 }
 
 /** Draw the footer with sync info. */
@@ -584,13 +681,18 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
  * once per night, so frequent refreshes aren't useful.
  */
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
-    // If not configured, just remind the user to log in — no API call
+    // If not configured, do nothing — user needs to log in on phone
     if (s_app_state == STATE_NO_CONFIG) {
         return;
     }
 
+    // If already loading, ignore additional presses
+    if (s_app_state == STATE_LOADING || s_app_state == STATE_CONNECTED) {
+        return;
+    }
+
     // Rate-limit manual syncs to avoid spamming the API
-    if (s_app_state == STATE_DISPLAY && s_last_sync_epoch > 0) {
+    if (s_last_sync_epoch > 0) {
         time_t seconds_since_sync = time(NULL) - s_last_sync_epoch;
         if (seconds_since_sync < MANUAL_SYNC_COOLDOWN_SECS) {
             int mins_remaining = (MANUAL_SYNC_COOLDOWN_SECS - seconds_since_sync) / 60 + 1;
@@ -606,11 +708,22 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
     send_data_request();
 }
 
+/** Long-press SELECT (3 seconds): force sync, bypassing cooldown. */
+static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+    if (s_app_state == STATE_NO_CONFIG) return;
+    if (s_app_state == STATE_LOADING || s_app_state == STATE_CONNECTED) return;
+
+    // Force sync — skip cooldown check
+    enter_loading_state();
+    send_data_request();
+}
+
 /** Register button click handlers for UP, DOWN, and SELECT. */
 static void click_config_provider(void *context) {
     window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
     window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
     window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
+    window_long_click_subscribe(BUTTON_ID_SELECT, 3000, select_long_click_handler, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,20 +762,49 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
     // -- Settings update from phone --
     Tuple *colorblind_tuple = dict_find(iterator, MESSAGE_KEY_COLORBLIND_MODE);
     Tuple *sync_int_tuple = dict_find(iterator, MESSAGE_KEY_SYNC_INTERVAL);
-    if (colorblind_tuple || sync_int_tuple) {
+    Tuple *show_events_tuple = dict_find(iterator, MESSAGE_KEY_SHOW_EVENTS);
+    if (colorblind_tuple || sync_int_tuple || show_events_tuple) {
         if (colorblind_tuple) {
             s_colorblind_mode = (colorblind_tuple->value->int32 == 1);
             persist_write_bool(PERSIST_KEY_COLORBLIND, s_colorblind_mode);
+        }
+        Tuple *text_ind_tuple = dict_find(iterator, MESSAGE_KEY_TEXT_INDICATORS);
+        if (text_ind_tuple) {
+            s_text_indicators = (text_ind_tuple->value->int32 == 1);
+            persist_write_bool(PERSIST_KEY_TEXT_INDICATORS, s_text_indicators);
         }
         if (sync_int_tuple) {
             s_sync_interval_hours = (int)sync_int_tuple->value->int32;
             if (s_sync_interval_hours < 4) s_sync_interval_hours = 4;
             persist_write_int(PERSIST_KEY_SYNC_INTERVAL, s_sync_interval_hours);
-            schedule_next_wakeup();  // Reschedule with new interval
+            schedule_next_wakeup();
         }
+
+        // Stat visibility flags
+        if (show_events_tuple) {
+            s_show_events = (show_events_tuple->value->int32 == 1);
+        }
+        Tuple *show_usage_tuple = dict_find(iterator, MESSAGE_KEY_SHOW_USAGE);
+        if (show_usage_tuple) {
+            s_show_usage = (show_usage_tuple->value->int32 == 1);
+        }
+        Tuple *show_mask_tuple = dict_find(iterator, MESSAGE_KEY_SHOW_MASK_OFF);
+        if (show_mask_tuple) {
+            s_show_mask_off = (show_mask_tuple->value->int32 == 1);
+        }
+        Tuple *show_leak_tuple = dict_find(iterator, MESSAGE_KEY_SHOW_LEAK);
+        if (show_leak_tuple) {
+            s_show_leak = (show_leak_tuple->value->int32 == 1);
+        }
+
+        // Save stat visibility as bitmask
+        int mask = (s_show_events ? 1 : 0) | (s_show_usage ? 2 : 0) |
+                   (s_show_mask_off ? 4 : 0) | (s_show_leak ? 8 : 0);
+        persist_write_int(PERSIST_KEY_VISIBLE_STATS, mask);
+
         layer_mark_dirty(s_canvas_layer);
-        APP_LOG(APP_LOG_LEVEL_INFO, "Settings updated: colorblind=%d, sync=%dh",
-                s_colorblind_mode, s_sync_interval_hours);
+        APP_LOG(APP_LOG_LEVEL_INFO, "Settings: colorblind=%d, sync=%dh, stats=%d",
+                s_colorblind_mode, s_sync_interval_hours, mask);
         return;
     }
 
@@ -735,6 +877,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         }
 
         persist_save_records();
+        persist_write_int(PERSIST_KEY_SYNC_EPOCH, (int)s_last_sync_epoch);
         layer_mark_dirty(s_canvas_layer);
     }
 }
@@ -820,9 +963,19 @@ static void init(void) {
         s_launched_by_wakeup = true;
     }
 
-    // Request fresh data on every launch
-    enter_loading_state();
-    send_data_request();
+    // Only fetch fresh data if cache is stale or empty.
+    // s_last_sync_epoch == 0 means fresh install or post-login (always fetch).
+    // Otherwise, only fetch if more than sync_interval has passed.
+    time_t now = time(NULL);
+    bool cache_is_stale = (s_last_sync_epoch == 0) ||
+                          ((now - s_last_sync_epoch) >= s_sync_interval_hours * 3600);
+
+    if (cache_is_stale || s_total_days == 0) {
+        enter_loading_state();
+        send_data_request();
+    }
+    // else: show cached data immediately, no API call
+
     schedule_next_wakeup();
 }
 

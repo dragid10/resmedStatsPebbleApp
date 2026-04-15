@@ -92,3 +92,7 @@ This app uses the unofficial ResMed myAir API, reverse-engineered from the myAir
 4. Query the AWS AppSync GraphQL endpoint for sleep records
 
 The API is undocumented and may change without notice. This app is not affiliated with or endorsed by ResMed.
+
+## Disclaimer
+
+This application is **not HIPAA compliant and does not intend to be**. CPAP therapy data is cached on the watch and transmitted over Bluetooth without application-layer encryption. This app is intended for personal use — it is not a medical device and should not be used for clinical decision-making.

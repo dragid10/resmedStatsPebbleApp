@@ -7,22 +7,24 @@
  *   3. GraphQL queries to fetch CPAP sleep records
  *   4. Sending data to the watch via AppMessage
  *
- * Credentials are stored ONLY in the phone's localStorage —
- * nothing is sent to any cloud or external server beyond ResMed's own API.
+ * Security notes:
+ *   - Credentials are stored in the phone's localStorage (platform limitation
+ *     — PebbleKit JS has no keychain/keystore API). Credentials are NEVER
+ *     sent over Bluetooth to the watch.
+ *   - Access tokens are cached and reused until they expire to minimize
+ *     the number of times credentials are sent to Okta.
+ *   - TLS certificate pinning is not available in PebbleKit JS's
+ *     XMLHttpRequest — this is an accepted platform limitation.
+ *   - All console.log output is sanitized — no credentials, tokens,
+ *     or response bodies are ever logged.
  *
- * Auth flow ported from ~/coding/sleep-dashboard/collectors/resmed.py
+ * Auth flow based on https://github.com/prestomation/resmed_myair_sensors
  */
 
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var sha256 = require('./sha256');
 
-/**
- * Clay custom function — runs inside the config page's browser context.
- * Intercepts the submit button to validate credentials against Okta
- * before closing the page. Shows "Login successful!" or an error
- * directly in the config page on the phone.
- */
 // Initialize Clay without a custom function (custom functions crash the
 // config page on some Pebble phone app versions). Login validation happens
 // in the webviewclosed handler instead.
@@ -51,13 +53,23 @@ var ERROR_MSG_MAX_LENGTH = 60;
 var MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** localStorage keys for persisted credentials. */
+/** localStorage keys for persisted data. */
 var STORAGE_KEY_EMAIL = 'resmed_email';
 var STORAGE_KEY_PASSWORD = 'resmed_password';
 var STORAGE_KEY_REGION = 'resmed_region';
+var STORAGE_KEY_ACCESS_TOKEN = 'resmed_access_token';
+var STORAGE_KEY_TOKEN_EXPIRY = 'resmed_token_expiry';
+var STORAGE_KEY_ID_TOKEN = 'resmed_id_token';
+var STORAGE_KEY_DEVICE_ID = 'resmed_device_id';
 
 /** Default region if none is configured. */
 var DEFAULT_REGION = 'NA';
+
+/**
+ * Maximum credential length — reject inputs longer than this
+ * to prevent memory issues and potential injection. (Finding #11)
+ */
+var MAX_CREDENTIAL_LENGTH = 256;
 
 // ---------------------------------------------------------------------------
 // Region Configuration
@@ -88,8 +100,50 @@ var REGION_CONFIG = {
 };
 
 // ---------------------------------------------------------------------------
-// PKCE Helpers — Generate code_verifier and code_challenge for OAuth2
+// Entropy & PKCE — Improved PRNG for security-sensitive values
 // ---------------------------------------------------------------------------
+// PebbleKit JS lacks crypto.getRandomValues(). We improve on raw
+// Math.random() by mixing multiple entropy sources through SHA-256.
+// This isn't a true CSPRNG but is significantly harder to predict
+// than raw Math.random() output. (Finding #2)
+
+/** Counter incremented each time entropy is consumed. */
+var entropyCounter = 0;
+
+/** Previous hash output, fed back as additional entropy. */
+var lastEntropyHash = '';
+
+/**
+ * Generate a random string using SHA-256 mixed entropy.
+ * Combines timestamp, counter, Math.random(), and previous hash
+ * to produce output that resists PRNG state reconstruction.
+ */
+function generateSecureRandom(length, charset) {
+  var result = '';
+  while (result.length < length) {
+    // Mix multiple entropy sources through SHA-256
+    var seed = Date.now() + ':' + (entropyCounter++) + ':' +
+               Math.random() + ':' + lastEntropyHash + ':' +
+               result.length;
+    var hashBytes = sha256(seed);
+    lastEntropyHash = bytesToHex(hashBytes);
+
+    // Use hash bytes to select characters from charset
+    for (var i = 0; i < hashBytes.length && result.length < length; i++) {
+      result += charset.charAt(hashBytes[i] % charset.length);
+    }
+  }
+  return result;
+}
+
+/** Convert a byte array to hex string (for entropy feedback). */
+function bytesToHex(bytes) {
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) {
+    hex += ('0' + bytes[i].toString(16)).slice(-2);
+  }
+  return hex;
+}
 
 /** Characters allowed in a PKCE code verifier (RFC 7636). */
 var PKCE_CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
@@ -101,21 +155,19 @@ var PKCE_VERIFIER_LENGTH = 128;
 var STATE_CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 
 /** Length of the generated OAuth state parameter. */
-var STATE_LENGTH = 16;
+var STATE_LENGTH = 32;
 
 /** Base64 encoding character set. */
 var BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
-/**
- * Generate a random PKCE code verifier string.
- * Uses Math.random() since PebbleKit JS lacks crypto.getRandomValues().
- */
+/** Generate a PKCE code verifier using mixed-entropy PRNG. */
 function generateCodeVerifier() {
-  var verifier = '';
-  for (var i = 0; i < PKCE_VERIFIER_LENGTH; i++) {
-    verifier += PKCE_CHARSET.charAt(Math.floor(Math.random() * PKCE_CHARSET.length));
-  }
-  return verifier;
+  return generateSecureRandom(PKCE_VERIFIER_LENGTH, PKCE_CHARSET);
+}
+
+/** Generate an OAuth state parameter using mixed-entropy PRNG. */
+function generateOAuthState() {
+  return generateSecureRandom(STATE_LENGTH, STATE_CHARSET);
 }
 
 /**
@@ -138,7 +190,6 @@ function bytesToBase64url(bytes) {
       result += BASE64_CHARS.charAt(byte3 & 63);
     }
   }
-  // Convert standard base64 to base64url (replace +/ with -_, strip padding)
   return result.replace(/\+/g, '-').replace(/\//g, '_');
 }
 
@@ -151,13 +202,23 @@ function generateCodeChallenge(codeVerifier) {
   return bytesToBase64url(hashBytes);
 }
 
-/** Generate a random state parameter for the OAuth2 authorize request. */
-function generateOAuthState() {
-  var state = '';
-  for (var i = 0; i < STATE_LENGTH; i++) {
-    state += STATE_CHARSET.charAt(Math.floor(Math.random() * STATE_CHARSET.length));
+// ---------------------------------------------------------------------------
+// Per-Installation Device ID (Finding #9)
+// ---------------------------------------------------------------------------
+// Generate a unique device UUID per installation to avoid correlating
+// all users under a single hardcoded rmdhandsetid.
+
+function getOrCreateDeviceId() {
+  var deviceId = localStorage.getItem(STORAGE_KEY_DEVICE_ID);
+  if (!deviceId) {
+    // Generate a UUID v4 format using our improved PRNG
+    var hex = bytesToHex(sha256(Date.now() + ':' + Math.random() + ':' + entropyCounter++));
+    deviceId = hex.substring(0, 8) + '-' + hex.substring(8, 12) + '-4' +
+               hex.substring(13, 16) + '-' + hex.substring(16, 20) + '-' +
+               hex.substring(20, 32);
+    localStorage.setItem(STORAGE_KEY_DEVICE_ID, deviceId);
   }
-  return state;
+  return deviceId;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,15 +230,12 @@ function generateOAuthState() {
  * Used to decode the JWT payload segment.
  */
 function decodeBase64url(encoded) {
-  // Add padding if needed
   var paddingNeeded = 4 - (encoded.length % 4);
   if (paddingNeeded !== 4) {
     for (var i = 0; i < paddingNeeded; i++) encoded += '=';
   }
-  // Convert base64url to standard base64
   encoded = encoded.replace(/-/g, '+').replace(/_/g, '/');
 
-  // Decode base64 to bytes
   var bytes = [];
   for (var i = 0; i < encoded.length; i += 4) {
     var b1 = BASE64_CHARS.indexOf(encoded.charAt(i));
@@ -194,7 +252,6 @@ function decodeBase64url(encoded) {
     }
   }
 
-  // Convert bytes to string
   var decoded = '';
   for (var i = 0; i < bytes.length; i++) {
     decoded += String.fromCharCode(bytes[i]);
@@ -203,33 +260,93 @@ function decodeBase64url(encoded) {
 }
 
 /**
- * Extract the myAirCountryId claim from a JWT id_token.
- * The country code is required for the GraphQL API's rmdcountry header.
- * Falls back to 'US' if the claim is missing or the token can't be decoded.
+ * Extract claims from a JWT id_token and perform basic validation.
+ * Validates issuer matches the expected Okta URL.
+ * Returns the decoded payload or null if validation fails. (Finding #5)
  */
-function extractCountryFromIdToken(idToken) {
+function decodeAndValidateIdToken(idToken, expectedIssuer) {
   try {
     var jwtSegments = idToken.split('.');
+    if (jwtSegments.length !== 3) return null;
+
     var payloadJson = decodeBase64url(jwtSegments[1]);
     var payload = JSON.parse(payloadJson);
-    return payload.myAirCountryId || 'US';
+
+    // Validate issuer matches our expected Okta server (Finding #5)
+    if (payload.iss && expectedIssuer && payload.iss.indexOf(expectedIssuer) === -1) {
+      console.log('JWT issuer mismatch');
+      return null;
+    }
+
+    return payload;
   } catch (e) {
-    console.log('Failed to decode id_token JWT: ' + e);
-    return 'US';
+    console.log('JWT decode failed');
+    return null;
   }
 }
 
+/**
+ * Extract the myAirCountryId from a validated JWT.
+ */
+function extractCountryFromIdToken(idToken, expectedIssuer) {
+  var payload = decodeAndValidateIdToken(idToken, expectedIssuer);
+  return (payload && payload.myAirCountryId) ? payload.myAirCountryId : 'US';
+}
+
 // ---------------------------------------------------------------------------
-// XHR Helper — Wrapper around XMLHttpRequest with timeout and error handling
+// HTML Escaping (Finding #8)
+// ---------------------------------------------------------------------------
+// Industry-standard approach: escape all characters that have special
+// meaning in HTML to prevent XSS when inserting user data into HTML strings.
+// Covers the OWASP recommended set for HTML body context.
+
+/**
+ * Escape a string for safe insertion into HTML.
+ * Replaces &, <, >, ", and ' with their HTML entity equivalents.
+ */
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ---------------------------------------------------------------------------
+// Input Validation (Finding #11)
+// ---------------------------------------------------------------------------
+
+/** Basic email format validation. */
+function isValidEmail(email) {
+  if (!email || typeof email !== 'string') return false;
+  if (email.length > MAX_CREDENTIAL_LENGTH) return false;
+  // Check for null bytes or control characters
+  if (/[\x00-\x1f]/.test(email)) return false;
+  // Basic email format: something@something.something
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+/** Basic password validation — just length and character safety. */
+function isValidPassword(password) {
+  if (!password || typeof password !== 'string') return false;
+  if (password.length > MAX_CREDENTIAL_LENGTH) return false;
+  if (password.length < 1) return false;
+  // Check for null bytes
+  if (/\x00/.test(password)) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// XHR Helper
 // ---------------------------------------------------------------------------
 
 /**
  * Make an HTTP request using XMLHttpRequest.
- * @param {string} url - Request URL
- * @param {string} method - HTTP method (GET, POST, etc.)
- * @param {string|null} body - Request body (null for GET)
- * @param {Object|null} headers - Key-value pairs of request headers
- * @param {Function} callback - Called with (error, statusCode, responseText)
+ * Note: TLS certificate pinning is not available in PebbleKit JS's
+ * XMLHttpRequest implementation — this is an accepted platform limitation.
+ * (Finding #7)
  */
 function makeHttpRequest(url, method, body, headers, callback) {
   var xhr = new XMLHttpRequest();
@@ -257,36 +374,27 @@ function makeHttpRequest(url, method, body, headers, callback) {
 }
 
 // ---------------------------------------------------------------------------
-// Watch Communication — Send messages to the Pebble watch
+// Watch Communication
 // ---------------------------------------------------------------------------
 
-/**
- * Send an error message to the watch for display.
- * Truncates to ERROR_MSG_MAX_LENGTH chars to fit in AppMessage buffer.
- */
+/** Send an error message to the watch for display. */
 function sendErrorToWatch(errorMessage) {
-  console.log('Sending error to watch: ' + errorMessage);
   Pebble.sendAppMessage(
     { 'ERROR_MSG': errorMessage.substring(0, ERROR_MSG_MAX_LENGTH) },
-    function () { console.log('Error message delivered to watch'); },
-    function () { console.log('Failed to deliver error message to watch'); }
+    function () {},
+    function () { console.log('Failed to deliver error to watch'); }
   );
 }
 
 // -- Sequential AppMessage Queue --
-// Pebble can only process one AppMessage at a time. Messages are queued
-// and sent one-by-one, waiting for each ACK before sending the next.
-
 var pendingMessages = [];
 var isMessageInFlight = false;
 
-/** Add a message to the send queue and start processing if idle. */
 function enqueueWatchMessage(message) {
   pendingMessages.push(message);
   processMessageQueue();
 }
 
-/** Send the next queued message if no message is currently in flight. */
 function processMessageQueue() {
   if (isMessageInFlight || pendingMessages.length === 0) return;
 
@@ -295,18 +403,58 @@ function processMessageQueue() {
 
   Pebble.sendAppMessage(message,
     function () {
-      // Success — send next message
       isMessageInFlight = false;
       processMessageQueue();
     },
-    function (error) {
-      // Failure — put message back and retry after a short delay
-      console.log('AppMessage send failed, retrying: ' + JSON.stringify(error));
+    function () {
+      // Retry after a short delay
       pendingMessages.unshift(message);
       isMessageInFlight = false;
       setTimeout(processMessageQueue, APPMESSAGE_RETRY_DELAY_MS);
     }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Token Cache (Findings #1 and #14)
+// ---------------------------------------------------------------------------
+// Cache the access token and reuse it until it expires, reducing the number
+// of times credentials are sent to Okta. Also serves as partial mitigation
+// for the plaintext password storage issue — credentials are only sent
+// when the token expires, not on every data refresh.
+
+/**
+ * Get a cached access token if it hasn't expired.
+ * Returns { accessToken, idToken } or null if expired/missing.
+ */
+function getCachedToken() {
+  var token = localStorage.getItem(STORAGE_KEY_ACCESS_TOKEN);
+  var expiry = localStorage.getItem(STORAGE_KEY_TOKEN_EXPIRY);
+  var idToken = localStorage.getItem(STORAGE_KEY_ID_TOKEN);
+
+  if (token && expiry && idToken) {
+    var expiryTime = parseInt(expiry, 10);
+    // Check with 5-minute buffer before actual expiry
+    if (Date.now() < expiryTime - 300000) {
+      return { accessToken: token, idToken: idToken };
+    }
+  }
+  return null;
+}
+
+/** Cache an access token with its expiry time. */
+function cacheToken(accessToken, idToken, expiresInSeconds) {
+  localStorage.setItem(STORAGE_KEY_ACCESS_TOKEN, accessToken);
+  localStorage.setItem(STORAGE_KEY_ID_TOKEN, idToken);
+  localStorage.setItem(STORAGE_KEY_TOKEN_EXPIRY,
+    '' + (Date.now() + expiresInSeconds * 1000));
+}
+
+/** Clear the cached token (on logout or auth failure). */
+function clearCachedToken() {
+  localStorage.removeItem(STORAGE_KEY_ACCESS_TOKEN);
+  localStorage.removeItem(STORAGE_KEY_TOKEN_EXPIRY);
+  localStorage.removeItem(STORAGE_KEY_ID_TOKEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,21 +464,24 @@ function processMessageQueue() {
 /**
  * Authenticate with ResMed's Okta SSO and obtain access + id tokens.
  *
- * Three-step OAuth2 flow:
+ * Uses cached tokens when available to minimize credential exposure.
+ * When re-authentication is needed, performs the 3-step OAuth2 flow:
  *   1. POST credentials to Okta /authn → sessionToken
  *   2. GET /authorize with PKCE + sessionToken → authorization code
- *      (uses response_mode=okta_post_message to avoid redirect issues)
  *   3. POST /token with code + code_verifier → access_token + id_token
- *
- * @param {string} email - myAir account email
- * @param {string} password - myAir account password
- * @param {string} region - 'NA' or 'EU'
- * @param {Function} callback - Called with (error, accessToken, idToken, regionConfig)
  */
 function authenticateWithOkta(email, password, region, callback) {
   var regionConfig = REGION_CONFIG[region];
   if (!regionConfig) {
-    callback('Invalid region: ' + region);
+    callback('Invalid region');
+    return;
+  }
+
+  // Try cached token first (Finding #14)
+  var cached = getCachedToken();
+  if (cached) {
+    console.log('Using cached access token');
+    callback(null, cached.accessToken, cached.idToken, regionConfig);
     return;
   }
 
@@ -338,7 +489,7 @@ function authenticateWithOkta(email, password, region, callback) {
   var authServerId = regionConfig.auth_server_id;
 
   // -- Step 1: Primary authentication (get session token) --
-  console.log('Auth step 1/3: Authenticating with Okta...');
+  console.log('Auth step 1/3');
 
   var credentialsPayload = JSON.stringify({ username: email, password: password });
 
@@ -348,7 +499,7 @@ function authenticateWithOkta(email, password, region, callback) {
     credentialsPayload,
     { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     function (networkError, httpStatus, responseBody) {
-      if (networkError) { callback('Network error: ' + networkError); return; }
+      if (networkError) { callback('Network error'); return; }
       if (httpStatus === 429) { callback('Rate limited. Try later.'); return; }
       if (httpStatus !== 200) { callback('Login failed (' + httpStatus + ')'); return; }
 
@@ -356,30 +507,34 @@ function authenticateWithOkta(email, password, region, callback) {
       try { authnResponse = JSON.parse(responseBody); }
       catch (e) { callback('Bad auth response'); return; }
 
+      // Finding #10: Don't instruct users to disable MFA
       if (authnResponse.status === 'MFA_REQUIRED') {
-        callback('MFA not supported. Disable MFA on myAir.');
+        callback('MFA accounts not yet supported. You may disable MFA on your myAir account, but this is not recommended as it reduces your account security.');
         return;
       }
       if (authnResponse.status !== 'SUCCESS') {
-        callback('Auth status: ' + authnResponse.status);
+        callback('Login failed');
         return;
       }
 
       var sessionToken = authnResponse.sessionToken;
-      console.log('Auth step 1/3: Got session token');
+      console.log('Auth step 1/3 complete');
 
       // -- Step 2: Exchange session token for authorization code via PKCE --
-      console.log('Auth step 2/3: Getting authorization code...');
+      console.log('Auth step 2/3');
 
       var codeVerifier = generateCodeVerifier();
       var codeChallenge = generateCodeChallenge(codeVerifier);
+
+      // Generate and store state for CSRF validation (Finding #4)
+      var oauthState = generateOAuthState();
 
       var authorizeUrl = oktaBaseUrl + '/oauth2/' + authServerId + '/v1/authorize?' +
         'client_id=' + encodeURIComponent(regionConfig.client_id) +
         '&response_type=code' +
         '&scope=' + encodeURIComponent('openid profile email') +
         '&redirect_uri=' + encodeURIComponent(regionConfig.redirect_url) +
-        '&state=' + generateOAuthState() +
+        '&state=' + encodeURIComponent(oauthState) +
         '&code_challenge_method=S256' +
         '&code_challenge=' + encodeURIComponent(codeChallenge) +
         '&sessionToken=' + encodeURIComponent(sessionToken) +
@@ -391,10 +546,9 @@ function authenticateWithOkta(email, password, region, callback) {
         null,
         { 'Accept': 'text/html' },
         function (networkError, httpStatus, responseBody) {
-          if (networkError) { callback('Auth code error: ' + networkError); return; }
+          if (networkError) { callback('Auth code error'); return; }
 
-          // Parse the authorization code from the HTML response body.
-          // Okta embeds it in JavaScript when using response_mode=okta_post_message.
+          // Parse authorization code from HTML response
           var authCodeMatch = responseBody.match(/data\.code\s*=\s*'([^']+)'/);
           if (!authCodeMatch) {
             authCodeMatch = responseBody.match(/code=([^"&\s]+)/);
@@ -403,18 +557,25 @@ function authenticateWithOkta(email, password, region, callback) {
             authCodeMatch = responseBody.match(/"code"\s*:\s*"([^"]+)"/);
           }
           if (!authCodeMatch) {
-            console.log('Could not find auth code in response (first 500 chars): ' +
-                        responseBody.substring(0, 500));
+            // Finding #6: Don't log the response body
             callback('Could not get auth code');
             return;
           }
 
           var authorizationCode = authCodeMatch[1];
-          console.log('Auth step 2/3: Got authorization code (length: ' +
-                      authorizationCode.length + ')');
+
+          // Validate OAuth state to prevent CSRF (Finding #4)
+          var stateMatch = responseBody.match(/data\.state\s*=\s*'([^']+)'/) ||
+                           responseBody.match(/state=([^"&\s]+)/);
+          if (stateMatch && stateMatch[1] !== oauthState) {
+            callback('Auth security check failed');
+            return;
+          }
+
+          console.log('Auth step 2/3 complete');
 
           // -- Step 3: Exchange authorization code for access token --
-          console.log('Auth step 3/3: Exchanging code for tokens...');
+          console.log('Auth step 3/3');
 
           var tokenRequestBody =
             'grant_type=authorization_code' +
@@ -429,18 +590,18 @@ function authenticateWithOkta(email, password, region, callback) {
             tokenRequestBody,
             { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
             function (networkError, httpStatus, responseBody) {
-              if (networkError) { callback('Token error: ' + networkError); return; }
+              if (networkError) { callback('Token error'); return; }
               if (httpStatus !== 200) {
-                console.log('Token exchange failed (' + httpStatus + '): ' +
-                            responseBody.substring(0, 300));
-                // Parse the error description if available
+                // Finding #6: Don't log response body — parse error safely
                 var tokenErrMsg = 'Login failed. Try again.';
                 try {
                   var errData = JSON.parse(responseBody);
                   if (errData.error_description) {
+                    // Truncate and sanitize for watch display
                     tokenErrMsg = errData.error_description.substring(0, 55);
                   }
                 } catch (ignored) {}
+                clearCachedToken();
                 callback(tokenErrMsg);
                 return;
               }
@@ -449,8 +610,15 @@ function authenticateWithOkta(email, password, region, callback) {
               try { tokenResponse = JSON.parse(responseBody); }
               catch (e) { callback('Bad token response'); return; }
 
-              console.log('Auth step 3/3: Authentication successful');
-              callback(null, tokenResponse.access_token, tokenResponse.id_token || '', regionConfig);
+              var accessToken = tokenResponse.access_token;
+              var idToken = tokenResponse.id_token || '';
+              var expiresIn = tokenResponse.expires_in || 3600;
+
+              // Cache the token to avoid re-authenticating on every request
+              cacheToken(accessToken, idToken, expiresIn);
+
+              console.log('Auth step 3/3 complete');
+              callback(null, accessToken, idToken, regionConfig);
             }
           );
         }
@@ -463,10 +631,6 @@ function authenticateWithOkta(email, password, region, callback) {
 // GraphQL — Fetch sleep records from the myAir AppSync API
 // ---------------------------------------------------------------------------
 
-/**
- * Format a Date object as an ISO date string (YYYY-MM-DD).
- * Required for the GraphQL startMonth/endMonth parameters.
- */
 function formatIsoDate(date) {
   var year = date.getFullYear();
   var month = ('0' + (date.getMonth() + 1)).slice(-2);
@@ -474,37 +638,27 @@ function formatIsoDate(date) {
   return year + '-' + month + '-' + day;
 }
 
-/**
- * Fetch CPAP sleep records from the myAir GraphQL API.
- *
- * @param {string} accessToken - OAuth2 access token from Okta
- * @param {string} idToken - JWT id_token containing myAirCountryId claim
- * @param {Object} regionConfig - Region-specific API configuration
- * @param {Function} callback - Called with (error, sleepRecordItems)
- */
 function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
-  var countryCode = extractCountryFromIdToken(idToken);
+  var expectedIssuer = regionConfig.okta_url;
+  var countryCode = extractCountryFromIdToken(idToken, expectedIssuer);
+  var deviceId = getOrCreateDeviceId();
 
-  // Build date range: today minus MAX_DAYS
   var today = new Date();
   var rangeStart = new Date(today.getTime() - MAX_DAYS * MS_PER_DAY);
   var startDate = formatIsoDate(rangeStart);
   var endDate = formatIsoDate(today);
 
-  // GraphQL query for sleep records
   var graphqlQuery =
     'query GetPatientSleepRecords { getPatientWrapper { ' +
     'sleepRecords(startMonth: "' + startDate + '", endMonth: "' + endDate + '") { ' +
     'items { startDate totalUsage sleepScore ahi maskPairCount leakPercentile __typename } ' +
     '__typename } __typename } }';
 
-  // Required headers for the myAir AppSync API
-  // (includes device metadata headers that the API expects)
   var requestHeaders = {
     'Authorization': 'Bearer ' + accessToken,
     'x-api-key': regionConfig.api_key,
     'Content-Type': 'application/json',
-    'rmdhandsetid': '02c1c662-c289-41fd-a9ae-196ff15b5166',
+    'rmdhandsetid': deviceId,  // Finding #9: per-install UUID
     'rmdlanguage': 'en',
     'rmdhandsetmodel': 'PebbleApp',
     'rmdhandsetosversion': '1.0.0',
@@ -517,7 +671,7 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
 
   var requestBody = JSON.stringify({ query: graphqlQuery });
 
-  console.log('Fetching sleep records (' + startDate + ' to ' + endDate + ')...');
+  console.log('Fetching sleep records');
 
   makeHttpRequest(
     regionConfig.graphql_url,
@@ -525,7 +679,15 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     requestBody,
     requestHeaders,
     function (networkError, httpStatus, responseBody) {
-      if (networkError) { callback('Network error: ' + networkError); return; }
+      if (networkError) { callback('Network error'); return; }
+
+      // If we get a 401, the cached token is stale — clear it so next
+      // attempt re-authenticates with credentials
+      if (httpStatus === 401) {
+        clearCachedToken();
+        callback('Session expired. Try again.');
+        return;
+      }
       if (httpStatus !== 200) { callback('API error (' + httpStatus + ')'); return; }
 
       var apiResponse;
@@ -533,7 +695,7 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
       catch (e) { callback('Bad API response'); return; }
 
       if (apiResponse.errors) {
-        console.log('GraphQL errors: ' + JSON.stringify(apiResponse.errors));
+        // Finding #6: Don't log the full error details
         callback('API error');
         return;
       }
@@ -553,13 +715,9 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
 }
 
 // ---------------------------------------------------------------------------
-// Data Formatting & Transmission — Prepare and send records to watch
+// Data Formatting & Transmission
 // ---------------------------------------------------------------------------
 
-/**
- * Format an ISO date string (e.g. "2024-04-14T...") into a short
- * display string (e.g. "Apr 14") for the watch screen.
- */
 function formatDateForWatch(isoDateString) {
   try {
     var datePart = isoDateString.split('T')[0];
@@ -568,41 +726,24 @@ function formatDateForWatch(isoDateString) {
     var dayOfMonth = parseInt(dateSegments[2], 10);
     return MONTH_NAMES[monthIndex] + ' ' + dayOfMonth;
   } catch (e) {
-    // Fallback: return the raw month-day portion
     return isoDateString.substring(5, 10);
   }
 }
 
-/**
- * Send an array of sleep record items to the watch via AppMessage.
- *
- * Records are sorted most-recent-first and sent one at a time through
- * the sequential message queue. The watch receives:
- *   1. TOTAL_DAYS message (how many records to expect)
- *   2. One message per day with all stats
- *   3. DATA_COMPLETE signal
- */
 function sendRecordsToWatch(sleepRecordItems) {
-  // Sort by date descending (most recent night first)
   sleepRecordItems.sort(function (a, b) {
     return (b.startDate || '').localeCompare(a.startDate || '');
   });
 
-  // Limit to MAX_DAYS records
   var recordsToSend = sleepRecordItems.slice(0, MAX_DAYS);
   var totalDays = recordsToSend.length;
 
-  console.log('Sending ' + totalDays + ' days of sleep data to watch');
+  console.log('Sending ' + totalDays + ' days to watch');
 
-  // First: tell the watch how many days to expect
   enqueueWatchMessage({ 'TOTAL_DAYS': totalDays });
 
-  // Then: send each day's data as a separate message
   for (var dayIndex = 0; dayIndex < totalDays; dayIndex++) {
     var record = recordsToSend[dayIndex];
-
-    // AHI is sent as integer × 10 to avoid floating point
-    // (e.g., AHI of 3.2 → 32)
     var ahiTimesTen = Math.round((record.ahi || 0) * 10);
 
     enqueueWatchMessage({
@@ -616,26 +757,17 @@ function sendRecordsToWatch(sleepRecordItems) {
     });
   }
 
-  // Finally: signal that all data has been sent
   enqueueWatchMessage({ 'DATA_COMPLETE': 1 });
 }
 
 // ---------------------------------------------------------------------------
-// Main Orchestration — Coordinate auth, fetch, and send
+// Main Orchestration
 // ---------------------------------------------------------------------------
 
-/** Guard flag to prevent concurrent data fetches. */
 var isDataFetchInProgress = false;
 
-/**
- * Main data fetch function. Loads credentials from localStorage,
- * authenticates with Okta, queries GraphQL, and sends results to watch.
- */
 function fetchAndSendSleepData() {
-  if (isDataFetchInProgress) {
-    console.log('Data fetch already in progress, skipping');
-    return;
-  }
+  if (isDataFetchInProgress) return;
 
   var email = localStorage.getItem(STORAGE_KEY_EMAIL);
   var password = localStorage.getItem(STORAGE_KEY_PASSWORD);
@@ -647,7 +779,7 @@ function fetchAndSendSleepData() {
   }
 
   isDataFetchInProgress = true;
-  console.log('Starting data fetch (region: ' + region + ')');
+  console.log('Starting data fetch');
 
   authenticateWithOkta(email, password, region,
     function (authError, accessToken, idToken, regionConfig) {
@@ -664,7 +796,6 @@ function fetchAndSendSleepData() {
             sendErrorToWatch(fetchError);
             return;
           }
-
           sendRecordsToWatch(sleepRecordItems);
         }
       );
@@ -676,7 +807,6 @@ function fetchAndSendSleepData() {
 // Pebble Event Listeners
 // ---------------------------------------------------------------------------
 
-/** App ready — fetch data if credentials exist, otherwise prompt setup. */
 Pebble.addEventListener('ready', function () {
   console.log('PebbleKit JS ready');
 
@@ -688,19 +818,16 @@ Pebble.addEventListener('ready', function () {
   }
 });
 
-/** Watch requested data refresh (SELECT button or wakeup trigger). */
 Pebble.addEventListener('appmessage', function (event) {
-  console.log('Received message from watch: ' + JSON.stringify(event.payload));
+  // Finding #6: Don't log the full payload
+  console.log('Message received from watch');
 
-  // If the watch reports a fresh install (no cached data on watch flash),
-  // clear any stale credentials left over from a previous install.
-  // PebbleKit JS localStorage persists across uninstall, but the watch's
-  // persistent storage is wiped, so we use the watch as source of truth.
   if (event.payload.FRESH_INSTALL !== undefined) {
-    console.log('Fresh install detected — clearing stale credentials');
+    console.log('Fresh install detected');
     localStorage.removeItem(STORAGE_KEY_EMAIL);
     localStorage.removeItem(STORAGE_KEY_PASSWORD);
     localStorage.removeItem(STORAGE_KEY_REGION);
+    clearCachedToken();
   }
 
   if (event.payload.REQUEST_DATA !== undefined) {
@@ -709,21 +836,18 @@ Pebble.addEventListener('appmessage', function (event) {
 });
 
 /**
- * User opened the settings page.
- * If already logged in, show a "Connected" page with a disconnect button.
- * If not logged in, show the Clay login form.
+ * Settings page — shows different content based on login state.
  */
 Pebble.addEventListener('showConfiguration', function () {
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
 
   if (savedEmail) {
     // Already connected — show status page with settings
-    var maskedEmail = savedEmail.charAt(0) + '***@' + savedEmail.split('@')[1];
+    // Finding #8: HTML-escape the email to prevent XSS
+    var maskedEmail = escapeHtml(savedEmail.charAt(0) + '***@' + savedEmail.split('@')[1]);
 
-    // Load current settings from localStorage
     var currentColorblind = localStorage.getItem('setting_colorblind') === 'true';
     var currentSyncInterval = localStorage.getItem('setting_sync_interval') || '4';
-    // Stat visibility (default all on)
     var showEvents = localStorage.getItem('setting_show_events') !== 'false';
     var showUsage = localStorage.getItem('setting_show_usage') !== 'false';
     var showMaskOff = localStorage.getItem('setting_show_mask_off') !== 'false';
@@ -758,32 +882,27 @@ Pebble.addEventListener('showConfiguration', function () {
       '.btn-danger{background:#d9534f;color:#fff;}' +
       '</style></head><body>' +
 
-      // -- Status card --
       '<div class="card card-center">' +
       '<div class="check">&#10003;</div>' +
       '<h2>Connected to myAir</h2>' +
       '<div class="email">' + maskedEmail + '</div>' +
       '<div class="info">Pulling your CPAP sleep stats for the past week.</div>' +
-      '<div class="privacy">Credentials stored locally on this phone only.</div>' +
+      '<div class="privacy">Credentials stored locally on this phone only. This app is not HIPAA compliant and does not intend to be.</div>' +
       '</div>' +
 
-      // -- Settings card --
       '<div class="card">' +
       '<h3>Settings</h3>' +
-
       '<div class="setting-row">' +
       '<div><div class="setting-label">Colorblind Mode</div>' +
-      '<div class="setting-desc">Use blue/orange instead of red/green</div></div>' +
+      '<div class="setting-desc">Monochrome display, no color meaning</div></div>' +
       '<label class="toggle"><input type="checkbox" id="colorblind"' +
-      (currentColorblind ? ' checked' : '') + '><span class="slider"></span></label>' +
-      '</div>' +
+      (currentColorblind ? ' checked' : '') + '><span class="slider"></span></label></div>' +
 
       '<div class="setting-row">' +
       '<div><div class="setting-label">Simple Mode</div>' +
       '<div class="setting-desc">Show Good/OK/Poor instead of numbers</div></div>' +
       '<label class="toggle"><input type="checkbox" id="text-indicators"' +
-      (textIndicators ? ' checked' : '') + '><span class="slider"></span></label>' +
-      '</div>' +
+      (textIndicators ? ' checked' : '') + '><span class="slider"></span></label></div>' +
 
       '<div class="setting-row">' +
       '<div><div class="setting-label">Sync Interval</div>' +
@@ -793,39 +912,28 @@ Pebble.addEventListener('showConfiguration', function () {
       '<option value="6"' + (currentSyncInterval === '6' ? ' selected' : '') + '>6 hours</option>' +
       '<option value="8"' + (currentSyncInterval === '8' ? ' selected' : '') + '>8 hours</option>' +
       '<option value="12"' + (currentSyncInterval === '12' ? ' selected' : '') + '>12 hours</option>' +
-      '</select>' +
-      '</div>' +
+      '</select></div></div>' +
 
-      '</div>' +
-
-      // -- Visible Stats card --
       '<div class="card">' +
       '<h3>Visible Stats</h3>' +
       '<div class="setting-desc" style="margin-bottom:12px;">Overall score is always shown. Choose which details to display below it.</div>' +
 
-      '<div class="setting-row">' +
-      '<div class="setting-label">Events (AHI)</div>' +
+      '<div class="setting-row"><div class="setting-label">Events (AHI)</div>' +
       '<label class="toggle"><input type="checkbox" id="show-events"' +
       (showEvents ? ' checked' : '') + '><span class="slider"></span></label></div>' +
 
-      '<div class="setting-row">' +
-      '<div class="setting-label">Usage</div>' +
+      '<div class="setting-row"><div class="setting-label">Usage</div>' +
       '<label class="toggle"><input type="checkbox" id="show-usage"' +
       (showUsage ? ' checked' : '') + '><span class="slider"></span></label></div>' +
 
-      '<div class="setting-row">' +
-      '<div class="setting-label">Mask Off</div>' +
+      '<div class="setting-row"><div class="setting-label">Mask Off</div>' +
       '<label class="toggle"><input type="checkbox" id="show-mask-off"' +
       (showMaskOff ? ' checked' : '') + '><span class="slider"></span></label></div>' +
 
-      '<div class="setting-row">' +
-      '<div class="setting-label">Leak</div>' +
+      '<div class="setting-row"><div class="setting-label">Leak</div>' +
       '<label class="toggle"><input type="checkbox" id="show-leak"' +
-      (showLeak ? ' checked' : '') + '><span class="slider"></span></label></div>' +
+      (showLeak ? ' checked' : '') + '><span class="slider"></span></label></div></div>' +
 
-      '</div>' +
-
-      // -- Buttons --
       '<button class="btn btn-save" onclick="saveSettings()">Save Settings</button>' +
       '<button class="btn btn-danger" onclick="disconnect()">Disconnect Account</button>' +
 
@@ -840,67 +948,53 @@ Pebble.addEventListener('showConfiguration', function () {
       'var sl=document.getElementById("show-leak").checked;' +
       'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({' +
       'COLORBLIND_MODE:cb,TEXT_INDICATORS:ti,SYNC_INTERVAL:parseInt(si),' +
-      'SHOW_EVENTS:se,SHOW_USAGE:su,SHOW_MASK_OFF:sm,SHOW_LEAK:sl}));' +
-      '}' +
+      'SHOW_EVENTS:se,SHOW_USAGE:su,SHOW_MASK_OFF:sm,SHOW_LEAK:sl}));}' +
       'function disconnect(){' +
       'if(confirm("Disconnect your ResMed account? Your credentials will be removed.")){' +
-      'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({Logout:true}));' +
-      '}}' +
+      'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({Logout:true}));}}' +
       '</script></body></html>';
 
     Pebble.openURL('data:text/html,' + encodeURIComponent(connectedPage));
   } else {
-    // Not logged in — show the Clay login form
     Pebble.openURL(clay.generateUrl());
   }
 });
 
 /**
- * User saved settings — extract credentials, store locally, and fetch data.
- * Credentials are intentionally NOT forwarded to the watch via AppMessage.
+ * Handle settings page close — process login, logout, or settings changes.
  */
 Pebble.addEventListener('webviewclosed', function (event) {
   if (!event || !event.response || event.response === '') return;
 
   try {
-    // Guard against non-JSON responses (e.g. user hit back button)
     var decodedCheck = decodeURIComponent(event.response);
-    if (!decodedCheck || decodedCheck.charAt(0) !== '{') {
-      console.log('Settings closed without saving (non-JSON response)');
-      return;
-    }
-    var decodedResponse = decodeURIComponent(event.response);
-    var parsed = JSON.parse(decodedResponse);
+    if (!decodedCheck || decodedCheck.charAt(0) !== '{') return;
 
-    // -- Handle logout (from the "Connected" status page) --
+    var parsed = JSON.parse(decodedCheck);
+
+    // -- Handle logout --
     var logoutFlag = parsed.Logout;
-    if (typeof logoutFlag === 'object' && logoutFlag !== null) {
-      logoutFlag = logoutFlag.value;
-    }
+    if (typeof logoutFlag === 'object' && logoutFlag !== null) logoutFlag = logoutFlag.value;
     if (logoutFlag === true || logoutFlag === 1 || logoutFlag === '1') {
       localStorage.removeItem(STORAGE_KEY_EMAIL);
       localStorage.removeItem(STORAGE_KEY_PASSWORD);
       localStorage.removeItem(STORAGE_KEY_REGION);
-      console.log('Credentials cleared — user disconnected');
+      clearCachedToken();
+      console.log('User disconnected');
       sendErrorToWatch('Open Settings to log in');
       return;
     }
 
-    // -- Handle settings update (from connected page) --
+    // -- Handle settings update --
     if (parsed.COLORBLIND_MODE !== undefined || parsed.SYNC_INTERVAL !== undefined) {
       var colorblind = parsed.COLORBLIND_MODE === true ? 1 : 0;
-      var syncHours = parsed.SYNC_INTERVAL || 4;
-
-      // Text indicators
       var textIndicators = parsed.TEXT_INDICATORS === true ? 1 : 0;
-
-      // Stat visibility
+      var syncHours = parsed.SYNC_INTERVAL || 4;
       var showEvents = parsed.SHOW_EVENTS === true ? 1 : 0;
       var showUsage = parsed.SHOW_USAGE === true ? 1 : 0;
       var showMaskOff = parsed.SHOW_MASK_OFF === true ? 1 : 0;
       var showLeak = parsed.SHOW_LEAK === true ? 1 : 0;
 
-      // Persist all settings locally
       localStorage.setItem('setting_colorblind', '' + (colorblind === 1));
       localStorage.setItem('setting_text_indicators', '' + (textIndicators === 1));
       localStorage.setItem('setting_sync_interval', '' + syncHours);
@@ -909,7 +1003,6 @@ Pebble.addEventListener('webviewclosed', function (event) {
       localStorage.setItem('setting_show_mask_off', '' + (showMaskOff === 1));
       localStorage.setItem('setting_show_leak', '' + (showLeak === 1));
 
-      // Send all settings to the watch in one message
       Pebble.sendAppMessage({
         'COLORBLIND_MODE': colorblind,
         'TEXT_INDICATORS': textIndicators,
@@ -918,42 +1011,44 @@ Pebble.addEventListener('webviewclosed', function (event) {
         'SHOW_USAGE': showUsage,
         'SHOW_MASK_OFF': showMaskOff,
         'SHOW_LEAK': showLeak
-      },
-        function () { console.log('Settings sent to watch'); },
-        function () { console.log('Failed to send settings to watch'); }
-      );
+      }, function () {}, function () {});
 
-      console.log('Settings updated (colorblind: ' + colorblind +
-                   ', sync: ' + syncHours + 'h)');
+      console.log('Settings updated');
       return;
     }
 
-    // -- Handle empty response (user closed without action) --
-    if (Object.keys(parsed).length === 0) {
-      console.log('Settings closed with no changes');
-      return;
-    }
+    // -- Handle empty response --
+    if (Object.keys(parsed).length === 0) return;
 
-    // -- Handle new login (from the Clay login form) --
+    // -- Handle new login --
     var email = parsed.Email;
     var password = parsed.Password;
     var region = parsed.Region;
 
-    // Unwrap Clay select/input objects
     if (typeof email === 'object' && email !== null) email = email.value;
     if (typeof password === 'object' && password !== null) password = password.value;
     if (typeof region === 'object' && region !== null) region = region.value;
+
+    // Finding #11: Validate credentials before storing
+    if (email && !isValidEmail(email)) {
+      sendErrorToWatch('Invalid email format');
+      return;
+    }
+    if (password && !isValidPassword(password)) {
+      sendErrorToWatch('Invalid password');
+      return;
+    }
 
     if (email) localStorage.setItem(STORAGE_KEY_EMAIL, '' + email);
     if (password) localStorage.setItem(STORAGE_KEY_PASSWORD, '' + password);
     if (region) localStorage.setItem(STORAGE_KEY_REGION, '' + region);
 
-    console.log('Credentials saved (email: ' + (email ? 'set' : 'empty') +
-                ', region: ' + (region || DEFAULT_REGION) + ')');
+    // Clear any stale cached token from a previous account
+    clearCachedToken();
 
-    // Fetch data with the new credentials
+    console.log('Credentials saved');
     fetchAndSendSleepData();
   } catch (parseError) {
-    console.log('Error parsing settings response: ' + parseError);
+    console.log('Settings parse error');
   }
 });

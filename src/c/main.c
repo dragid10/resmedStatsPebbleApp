@@ -207,6 +207,17 @@ static bool s_launched_by_wakeup = false;
 static time_t s_last_sync_epoch = 0;           // Unix timestamp of last successful sync
 
 // ---------------------------------------------------------------------------
+// Utility — Bounds clamping for safe int32 → int16_t conversion (Finding #13)
+// ---------------------------------------------------------------------------
+
+/** Clamp a 32-bit value to a valid int16_t range. */
+static int16_t clamp_int16(int32_t value, int16_t min_val, int16_t max_val) {
+    if (value < min_val) return min_val;
+    if (value > max_val) return max_val;
+    return (int16_t)value;
+}
+
+// ---------------------------------------------------------------------------
 // Color Helpers — Map clinical values to color-coded indicators
 // ---------------------------------------------------------------------------
 
@@ -777,7 +788,15 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         if (strstr(error_tuple->value->cstring, "Settings") != NULL ||
             strstr(error_tuple->value->cstring, "log in") != NULL) {
             s_app_state = STATE_NO_CONFIG;
-            s_last_sync_epoch = 0;  // Clear cooldown so next login syncs immediately
+            s_last_sync_epoch = 0;
+            // Clear cached medical data from watch storage (Finding #12)
+            s_total_days = 0;
+            memset(s_records, 0, sizeof(s_records));
+            s_last_sync_time[0] = '\0';
+            persist_delete(PERSIST_KEY_RECORDS);
+            persist_delete(PERSIST_KEY_TOTAL);
+            persist_delete(PERSIST_KEY_SYNC);
+            persist_delete(PERSIST_KEY_SYNC_EPOCH);
         } else {
             snprintf(s_error_message, sizeof(s_error_message), "%s",
                      error_tuple->value->cstring);
@@ -868,20 +887,21 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
                          tuple->value->cstring);
             }
 
+            // Clamp values to valid ranges to prevent int16_t truncation (Finding #13)
             tuple = dict_find(iterator, MESSAGE_KEY_SLEEP_SCORE);
-            if (tuple) record->sleep_score = (int16_t)tuple->value->int32;
+            if (tuple) record->sleep_score = clamp_int16(tuple->value->int32, 0, 100);
 
             tuple = dict_find(iterator, MESSAGE_KEY_AHI_X10);
-            if (tuple) record->ahi_x10 = (int16_t)tuple->value->int32;
+            if (tuple) record->ahi_x10 = clamp_int16(tuple->value->int32, 0, 9999);
 
             tuple = dict_find(iterator, MESSAGE_KEY_USAGE_MINS);
-            if (tuple) record->usage_mins = (int16_t)tuple->value->int32;
+            if (tuple) record->usage_mins = clamp_int16(tuple->value->int32, 0, 1440);
 
             tuple = dict_find(iterator, MESSAGE_KEY_MASK_COUNT);
-            if (tuple) record->mask_count = (int16_t)tuple->value->int32;
+            if (tuple) record->mask_count = clamp_int16(tuple->value->int32, 0, 999);
 
             tuple = dict_find(iterator, MESSAGE_KEY_LEAK_PCT);
-            if (tuple) record->leak_pct = (int16_t)tuple->value->int32;
+            if (tuple) record->leak_pct = clamp_int16(tuple->value->int32, 0, 100);
 
             record->has_data = true;
         }

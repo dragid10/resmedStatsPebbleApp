@@ -1,0 +1,59 @@
+{
+  "name": "resmedStatsPebbleApp",
+  "author": "dragid10",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {
+    "@rebble/clay": "^1.0.8"
+  },
+  "pebble": {
+    "displayName": "ResMed Stats",
+    "uuid": "d607a5ed-bb8b-41ee-ace2-10db69f73b46",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "capabilities": [
+      "configurable"
+    ],
+    "targetPlatforms": [
+      "aplite",
+      "basalt",
+      "chalk",
+      "diorite",
+      "emery",
+      "flint",
+      "gabbro"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [
+      "REQUEST_DATA",
+      "DAY_INDEX",
+      "RECORD_DATE",
+      "SLEEP_SCORE",
+      "AHI_X10",
+      "USAGE_MINS",
+      "MASK_COUNT",
+      "LEAK_PCT",
+      "TOTAL_DAYS",
+      "DATA_COMPLETE",
+      "ERROR_MSG",
+      "Email",
+      "Password",
+      "Region",
+      "Logout",
+      "FRESH_INSTALL"
+    ],
+    "resources": {
+      "media": [
+        {
+          "type": "png",
+          "name": "IMAGE_MENU_ICON",
+          "file": "icon_25x25.png",
+          "menuIcon": true
+        }
+      ]
+    }
+  }
+}

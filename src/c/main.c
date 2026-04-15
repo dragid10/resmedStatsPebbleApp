@@ -371,9 +371,9 @@ static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
     static char leak_text[8];
     snprintf(leak_text, sizeof(leak_text), "%d%%", record->leak_pct);
 
-    draw_stat_row(ctx, stats_top, W, "AHI", ahi_text, get_ahi_color(record->ahi_x10));
+    draw_stat_row(ctx, stats_top, W, "Events", ahi_text, get_ahi_color(record->ahi_x10));
     draw_stat_row(ctx, stats_top + row_h, W, "Usage", usage_text, get_usage_color(record->usage_mins));
-    draw_stat_row(ctx, stats_top + row_h * 2, W, "Mask", mask_text, COLOR_VALUE);
+    draw_stat_row(ctx, stats_top + row_h * 2, W, "Mask Off", mask_text, COLOR_VALUE);
     draw_stat_row(ctx, stats_top + row_h * 3, W, "Leak", leak_text, COLOR_VALUE);
 }
 

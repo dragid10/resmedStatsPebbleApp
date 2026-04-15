@@ -1,0 +1,94 @@
+# ResMed Stats for Pebble
+
+A Pebble smartwatch app that connects to your ResMed myAir account and displays your CPAP sleep therapy stats for the past week.
+
+## Features
+
+- **myAir Score** displayed prominently with color-coded indicators (green/yellow/red)
+- **Daily stats**: Events (AHI), Usage, Mask Off count, Leak percentage
+- **Cycle through days** with UP/DOWN buttons (most recent first)
+- **Manual sync** with SELECT button (long-press 3s to force refresh)
+- **Automatic background sync** via configurable interval (4/6/8/12 hours)
+- **Cached data** — app launches instantly with stored data, only fetches when stale
+- **Phone settings page** with login, logout, and configurable options
+
+## Settings (via phone companion)
+
+After logging in, the settings page offers:
+
+| Setting | Description |
+|---------|-------------|
+| **Colorblind Mode** | Monochrome display — all values in white, no color meaning |
+| **Simple Mode** | Replaces numbers with "Good" / "OK" / "Poor" text |
+| **Sync Interval** | How often to auto-refresh (4, 6, 8, or 12 hours) |
+| **Visible Stats** | Toggle which stats appear below the score |
+| **Disconnect** | Clear credentials and log out |
+
+## Controls
+
+| Button | Action |
+|--------|--------|
+| **UP** | Previous day |
+| **DOWN** | Next day |
+| **SELECT** | Sync data (15-min cooldown) |
+| **SELECT (3s hold)** | Force sync (bypasses cooldown) |
+| **BACK** | Exit app |
+
+## Privacy
+
+- Credentials are stored **only on your phone** in the Pebble companion app's local storage
+- Nothing is sent to any cloud service or external server beyond ResMed's own API
+- The watch stores only sleep data (scores, stats) — never credentials
+- Uninstalling the app clears all stored data
+
+## How It Works
+
+```
+Phone (PebbleKit JS)              Watch (C)
+─────────────────────            ──────────────
+1. Okta OAuth2 + PKCE     ←──   REQUEST_DATA
+2. GraphQL query           ──→   Sleep records
+3. Send day-by-day         ──→   Display & cache
+```
+
+The phone companion handles all authentication and API communication. The watch only receives and displays the resulting sleep data.
+
+## Supported Platforms
+
+All Pebble hardware: Aplite, Basalt, Chalk, Diorite, Emery, Flint, Gabbro.
+
+The UI layout is fully proportional — it scales from the smallest (144x168) to the largest (200x228) screen.
+
+## Building
+
+```bash
+npm install
+pebble build
+```
+
+## Installing
+
+```bash
+# Via CloudPebble proxy (phone must have Dev Connect enabled)
+pebble install --cloudpebble
+
+# Via direct WiFi (phone and computer on same network)
+pebble install --phone <PHONE_IP>
+```
+
+## Requirements
+
+- A ResMed myAir account (North America or Europe)
+- A Pebble watch paired with a phone running the Pebble companion app
+- MFA must be disabled on the myAir account (not yet supported)
+
+## API Details
+
+This app uses the unofficial ResMed myAir API, reverse-engineered from the myAir web application. The authentication flow is:
+
+1. POST credentials to Okta `/api/v1/authn` to get a session token
+2. Exchange session token for an authorization code via OAuth2 PKCE
+3. Exchange the authorization code for access and ID tokens
+4. Query the AWS AppSync GraphQL endpoint for sleep records
+
+The API is undocumented and may change without notice. This app is not affiliated with or endorsed by ResMed.

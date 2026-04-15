@@ -62,7 +62,15 @@
 /** Key for storing sync interval in hours. */
 #define PERSIST_KEY_SYNC_INTERVAL 5
 
-/** Key for storing visible stats bitmask. */
+/**
+ * Key for storing visible stats as a bitmask (single integer).
+ * Each bit represents one stat: bit 0 = Events, bit 1 = Usage,
+ * bit 2 = Mask Off, bit 3 = Leak. A set bit means the stat is shown.
+ * This is more efficient than a list for a fixed set of 4 items —
+ * one persist read/write, no dynamic memory, and the visible count
+ * is derived by summing the flags via get_visible_stat_count().
+ * If the count is 0, the score takes up the full display.
+ */
 #define PERSIST_KEY_VISIBLE_STATS 6
 
 /** Key for storing the last sync epoch (unix timestamp). */
@@ -383,33 +391,59 @@ static void draw_header(GContext *ctx, GRect bounds, SleepRecord *record) {
     }
 }
 
+/** Count how many stat rows are currently enabled. */
+static int get_visible_stat_count(void) {
+    int count = 0;
+    if (s_show_events) count++;
+    if (s_show_usage) count++;
+    if (s_show_mask_off) count++;
+    if (s_show_leak) count++;
+    return count;
+}
+
 /** Draw the large centered myAir score as the hero element. */
 static void draw_score_hero(GContext *ctx, GRect bounds, SleepRecord *record) {
     int W = bounds.size.w;
     int H = bounds.size.h;
-    // Position score below header (header is ~13% of height)
-    int score_y = H * 15 / 100;
 
     if (!record || !record->has_data) return;
 
-    // Large score number
+    bool full_view = (get_visible_stat_count() == 0);
+
+    // Score number — larger and centered when no stats are shown
     static char score_num[8];
     snprintf(score_num, sizeof(score_num), "%d", record->sleep_score);
 
+    int score_y, score_font_h;
+    GFont score_font;
+
+    if (full_view) {
+        // Full view: big score centered vertically
+        score_font = fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD);
+        score_font_h = 48;
+        score_y = H / 2 - 36;
+    } else {
+        // Normal view: score in upper portion
+        score_font = fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS);
+        score_font_h = 40;
+        score_y = H * 15 / 100;
+    }
+
     graphics_context_set_text_color(ctx, get_score_color(record->sleep_score));
-    graphics_draw_text(ctx, score_num,
-        fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS),
-        GRect(0, score_y, W, 40),
+    graphics_draw_text(ctx, score_num, score_font,
+        GRect(0, score_y, W, score_font_h),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
     // Score label — show "myAir Score" or the text interpretation
     const char *score_label = s_text_indicators ?
         get_score_text(record->sleep_score) : "myAir Score";
 
+    int label_y = full_view ? score_y + score_font_h : score_y + 38;
+
     graphics_context_set_text_color(ctx, COLOR_LABEL);
     graphics_draw_text(ctx, score_label,
-        fonts_get_system_font(FONT_KEY_GOTHIC_14),
-        GRect(0, score_y + 38, W, 16),
+        fonts_get_system_font(full_view ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_14),
+        GRect(0, label_y, W, 20),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
@@ -444,13 +478,7 @@ static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
     int H = bounds.size.h;
     int footer_h = 18;
 
-    // Count visible stats to distribute vertical space evenly
-    int visible_count = 0;
-    if (s_show_events) visible_count++;
-    if (s_show_usage) visible_count++;
-    if (s_show_mask_off) visible_count++;
-    if (s_show_leak) visible_count++;
-
+    int visible_count = get_visible_stat_count();
     if (visible_count == 0) return;
 
     int stats_top = H * 51 / 100;

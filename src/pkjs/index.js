@@ -717,39 +717,89 @@ Pebble.addEventListener('showConfiguration', function () {
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
 
   if (savedEmail) {
-    // Already connected — show the connected status page
+    // Already connected — show status page with settings
     var maskedEmail = savedEmail.charAt(0) + '***@' + savedEmail.split('@')[1];
+
+    // Load current settings from localStorage
+    var currentColorblind = localStorage.getItem('setting_colorblind') === 'true';
+    var currentSyncInterval = localStorage.getItem('setting_sync_interval') || '4';
+
     var connectedPage = '<!DOCTYPE html><html><head>' +
       '<meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<style>' +
-      'body{font-family:-apple-system,sans-serif;background:#1a1a1a;color:#fff;margin:0;padding:20px;display:flex;flex-direction:column;min-height:100vh;box-sizing:border-box;}' +
-      '.card{background:#2a2a2a;border-radius:12px;padding:24px;margin:20px 0;text-align:center;}' +
-      '.check{font-size:48px;color:#4CAF50;margin-bottom:12px;}' +
-      'h2{margin:0 0 8px;font-size:22px;}' +
-      '.email{color:#aaa;font-size:14px;margin-bottom:16px;}' +
-      '.info{color:#bbb;font-size:14px;line-height:1.5;margin:12px 0;}' +
-      '.privacy{color:#888;font-size:12px;margin:16px 0;line-height:1.4;}' +
-      '.btn{display:block;width:100%;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;margin:8px 0;box-sizing:border-box;}' +
+      'body{font-family:-apple-system,sans-serif;background:#1a1a1a;color:#fff;margin:0;padding:20px;box-sizing:border-box;}' +
+      '.card{background:#2a2a2a;border-radius:12px;padding:20px;margin:16px 0;}' +
+      '.card-center{text-align:center;}' +
+      '.check{font-size:40px;color:#4CAF50;margin-bottom:8px;}' +
+      'h2{margin:0 0 6px;font-size:20px;}' +
+      'h3{margin:0 0 12px;font-size:16px;color:#aaa;font-weight:normal;}' +
+      '.email{color:#aaa;font-size:14px;margin-bottom:12px;}' +
+      '.info{color:#bbb;font-size:13px;line-height:1.5;margin:8px 0;}' +
+      '.privacy{color:#888;font-size:11px;margin:12px 0;line-height:1.4;}' +
+      '.setting-row{display:flex;justify-content:space-between;align-items:center;padding:14px 0;border-bottom:1px solid #3a3a3a;}' +
+      '.setting-row:last-child{border-bottom:none;}' +
+      '.setting-label{font-size:15px;}' +
+      '.setting-desc{font-size:12px;color:#888;margin-top:4px;}' +
+      'select{background:#3a3a3a;color:#fff;border:1px solid #555;border-radius:6px;padding:8px 12px;font-size:14px;}' +
+      '.toggle{position:relative;width:50px;height:28px;cursor:pointer;}' +
+      '.toggle input{opacity:0;width:0;height:0;}' +
+      '.slider{position:absolute;top:0;left:0;right:0;bottom:0;background:#555;border-radius:14px;transition:.3s;}' +
+      '.slider:before{content:"";position:absolute;height:22px;width:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s;}' +
+      '.toggle input:checked+.slider{background:#4CAF50;}' +
+      '.toggle input:checked+.slider:before{transform:translateX(22px);}' +
+      '.btn{display:block;width:100%;padding:14px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;margin:8px 0;box-sizing:border-box;}' +
+      '.btn-save{background:#4A90D9;color:#fff;}' +
       '.btn-danger{background:#d9534f;color:#fff;}' +
-      '.btn-close{background:#4A90D9;color:#fff;}' +
       '</style></head><body>' +
-      '<div class="card">' +
+
+      // -- Status card --
+      '<div class="card card-center">' +
       '<div class="check">&#10003;</div>' +
       '<h2>Connected to myAir</h2>' +
       '<div class="email">' + maskedEmail + '</div>' +
-      '<div class="info">Your Pebble is pulling your CPAP sleep stats for the past week. Press SELECT on your watch to refresh data anytime.</div>' +
-      '<div class="privacy">Your credentials are stored locally on this phone only. Nothing is stored in the cloud.</div>' +
+      '<div class="info">Pulling your CPAP sleep stats for the past week.</div>' +
+      '<div class="privacy">Credentials stored locally on this phone only.</div>' +
       '</div>' +
+
+      // -- Settings card --
+      '<div class="card">' +
+      '<h3>Settings</h3>' +
+
+      '<div class="setting-row">' +
+      '<div><div class="setting-label">Colorblind Mode</div>' +
+      '<div class="setting-desc">Use patterns instead of red/yellow/green</div></div>' +
+      '<label class="toggle"><input type="checkbox" id="colorblind"' +
+      (currentColorblind ? ' checked' : '') + '><span class="slider"></span></label>' +
+      '</div>' +
+
+      '<div class="setting-row">' +
+      '<div><div class="setting-label">Sync Interval</div>' +
+      '<div class="setting-desc">How often to refresh data</div></div>' +
+      '<select id="sync-interval">' +
+      '<option value="4"' + (currentSyncInterval === '4' ? ' selected' : '') + '>4 hours</option>' +
+      '<option value="6"' + (currentSyncInterval === '6' ? ' selected' : '') + '>6 hours</option>' +
+      '<option value="8"' + (currentSyncInterval === '8' ? ' selected' : '') + '>8 hours</option>' +
+      '<option value="12"' + (currentSyncInterval === '12' ? ' selected' : '') + '>12 hours</option>' +
+      '</select>' +
+      '</div>' +
+
+      '</div>' +
+
+      // -- Buttons --
+      '<button class="btn btn-save" onclick="saveSettings()">Save Settings</button>' +
       '<button class="btn btn-danger" onclick="disconnect()">Disconnect Account</button>' +
-      '<button class="btn btn-close" onclick="closePage()">Close</button>' +
+
       '<script>' +
+      'function saveSettings(){' +
+      'var cb=document.getElementById("colorblind").checked;' +
+      'var si=document.getElementById("sync-interval").value;' +
+      'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({' +
+      'COLORBLIND_MODE:cb,SYNC_INTERVAL:parseInt(si)}));' +
+      '}' +
       'function disconnect(){' +
       'if(confirm("Disconnect your ResMed account? Your credentials will be removed.")){' +
       'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({Logout:true}));' +
       '}}' +
-      'function closePage(){' +
-      'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({}));' +
-      '}' +
       '</script></body></html>';
 
     Pebble.openURL('data:text/html,' + encodeURIComponent(connectedPage));
@@ -790,7 +840,30 @@ Pebble.addEventListener('webviewclosed', function (event) {
       return;
     }
 
-    // -- Handle empty response (user closed the connected page without action) --
+    // -- Handle settings update (from connected page) --
+    if (parsed.COLORBLIND_MODE !== undefined || parsed.SYNC_INTERVAL !== undefined) {
+      var colorblind = parsed.COLORBLIND_MODE === true ? 1 : 0;
+      var syncHours = parsed.SYNC_INTERVAL || 4;
+
+      // Persist settings locally
+      localStorage.setItem('setting_colorblind', '' + (colorblind === 1));
+      localStorage.setItem('setting_sync_interval', '' + syncHours);
+
+      // Send settings to the watch
+      Pebble.sendAppMessage({
+        'COLORBLIND_MODE': colorblind,
+        'SYNC_INTERVAL': syncHours
+      },
+        function () { console.log('Settings sent to watch'); },
+        function () { console.log('Failed to send settings to watch'); }
+      );
+
+      console.log('Settings updated (colorblind: ' + colorblind +
+                   ', sync: ' + syncHours + 'h)');
+      return;
+    }
+
+    // -- Handle empty response (user closed without action) --
     if (Object.keys(parsed).length === 0) {
       console.log('Settings closed with no changes');
       return;

@@ -43,7 +43,9 @@
       "Password",
       "Region",
       "Logout",
-      "FRESH_INSTALL"
+      "FRESH_INSTALL",
+      "COLORBLIND_MODE",
+      "SYNC_INTERVAL"
     ],
     "resources": {
       "media": [

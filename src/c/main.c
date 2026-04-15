@@ -56,6 +56,12 @@
 /** Key for storing the last sync timestamp string. */
 #define PERSIST_KEY_SYNC     3
 
+/** Key for storing colorblind mode setting (0=off, 1=on). */
+#define PERSIST_KEY_COLORBLIND 4
+
+/** Key for storing sync interval in hours. */
+#define PERSIST_KEY_SYNC_INTERVAL 5
+
 // -- AppMessage Buffer Sizes --
 
 /** Inbox buffer size — must fit one day's data (~70 bytes) with headroom. */
@@ -159,6 +165,10 @@ static char s_last_sync_time[SYNC_TIME_MAX_LEN];
 static int s_loading_dot_count = 0;      // Current number of dots (0-2)
 static AppTimer *s_loading_anim_timer = NULL;
 
+// -- Settings --
+static bool s_colorblind_mode = false;         // Use high-contrast indicators instead of colors
+static int s_sync_interval_hours = 4;          // Hours between automatic syncs
+
 // -- Sync Timing --
 static WakeupId s_wakeup_id = -1;
 static bool s_launched_by_wakeup = false;
@@ -168,22 +178,34 @@ static time_t s_last_sync_epoch = 0;           // Unix timestamp of last success
 // Color Helpers — Map clinical values to color-coded indicators
 // ---------------------------------------------------------------------------
 
-/** Returns green/yellow/red based on the myAir sleep score. */
+/**
+ * Returns green/yellow/red based on the myAir sleep score.
+ * In colorblind mode, returns white (text indicators are used instead).
+ */
 static GColor get_score_color(int score) {
+    if (s_colorblind_mode) return COLOR_VALUE;
     if (score >= SCORE_GOOD_THRESHOLD) return COLOR_SCORE_GOOD;
     if (score >= SCORE_OK_THRESHOLD) return COLOR_SCORE_OK;
     return COLOR_SCORE_BAD;
 }
 
-/** Returns green/yellow/red based on the AHI value (×10 to avoid floats). */
+/**
+ * Returns green/yellow/red based on AHI value (×10 to avoid floats).
+ * In colorblind mode, returns white.
+ */
 static GColor get_ahi_color(int ahi_x10) {
+    if (s_colorblind_mode) return COLOR_VALUE;
     if (ahi_x10 < AHI_NORMAL_THRESHOLD_X10) return COLOR_SCORE_GOOD;
     if (ahi_x10 < AHI_MILD_THRESHOLD_X10) return COLOR_SCORE_OK;
     return COLOR_SCORE_BAD;
 }
 
-/** Returns green/yellow/red based on CPAP usage duration in minutes. */
+/**
+ * Returns green/yellow/red based on CPAP usage duration in minutes.
+ * In colorblind mode, returns white.
+ */
 static GColor get_usage_color(int usage_mins) {
+    if (s_colorblind_mode) return COLOR_VALUE;
     if (usage_mins >= USAGE_GOOD_THRESHOLD_MINS) return COLOR_SCORE_GOOD;
     if (usage_mins >= USAGE_OK_THRESHOLD_MINS) return COLOR_SCORE_OK;
     return COLOR_SCORE_BAD;
@@ -200,7 +222,7 @@ static void persist_save_records(void) {
     persist_write_string(PERSIST_KEY_SYNC, s_last_sync_time);
 }
 
-/** Load cached records from persistent storage (if any exist). */
+/** Load cached records and settings from persistent storage. */
 static void persist_load_records(void) {
     if (persist_exists(PERSIST_KEY_RECORDS)) {
         persist_read_data(PERSIST_KEY_RECORDS, s_records, sizeof(s_records));
@@ -209,6 +231,13 @@ static void persist_load_records(void) {
         if (s_total_days > 0) {
             s_app_state = STATE_DISPLAY;
         }
+    }
+    if (persist_exists(PERSIST_KEY_COLORBLIND)) {
+        s_colorblind_mode = persist_read_bool(PERSIST_KEY_COLORBLIND);
+    }
+    if (persist_exists(PERSIST_KEY_SYNC_INTERVAL)) {
+        s_sync_interval_hours = persist_read_int(PERSIST_KEY_SYNC_INTERVAL);
+        if (s_sync_interval_hours < 4) s_sync_interval_hours = 4;
     }
 }
 
@@ -221,7 +250,9 @@ static void schedule_next_wakeup(void) {
     if (s_wakeup_id >= 0) {
         wakeup_cancel(s_wakeup_id);
     }
-    time_t next_wakeup_time = time(NULL) + WAKEUP_INTERVAL_SECS;
+    // Use the user's configured sync interval (default 4 hours)
+    int interval_secs = s_sync_interval_hours * 3600;
+    time_t next_wakeup_time = time(NULL) + interval_secs;
     s_wakeup_id = wakeup_schedule(next_wakeup_time, WAKEUP_REASON_REFRESH, true);
 }
 
@@ -612,6 +643,26 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
             s_app_state = STATE_ERROR;
         }
         layer_mark_dirty(s_canvas_layer);
+        return;
+    }
+
+    // -- Settings update from phone --
+    Tuple *colorblind_tuple = dict_find(iterator, MESSAGE_KEY_COLORBLIND_MODE);
+    Tuple *sync_int_tuple = dict_find(iterator, MESSAGE_KEY_SYNC_INTERVAL);
+    if (colorblind_tuple || sync_int_tuple) {
+        if (colorblind_tuple) {
+            s_colorblind_mode = (colorblind_tuple->value->int32 == 1);
+            persist_write_bool(PERSIST_KEY_COLORBLIND, s_colorblind_mode);
+        }
+        if (sync_int_tuple) {
+            s_sync_interval_hours = (int)sync_int_tuple->value->int32;
+            if (s_sync_interval_hours < 4) s_sync_interval_hours = 4;
+            persist_write_int(PERSIST_KEY_SYNC_INTERVAL, s_sync_interval_hours);
+            schedule_next_wakeup();  // Reschedule with new interval
+        }
+        layer_mark_dirty(s_canvas_layer);
+        APP_LOG(APP_LOG_LEVEL_INFO, "Settings updated: colorblind=%d, sync=%dh",
+                s_colorblind_mode, s_sync_interval_hours);
         return;
     }
 

@@ -959,6 +959,27 @@ static void wakeup_handler(WakeupId id, int32_t reason) {
 }
 
 // ---------------------------------------------------------------------------
+// Tap Handler — Double-tap to toggle simple mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Accelerometer tap handler. A single shake toggles simple mode
+ * (text indicators vs numeric values) without opening phone settings.
+ */
+static void tap_handler(AccelAxisType axis, int32_t direction) {
+    if (s_app_state != STATE_DISPLAY) return;
+
+    s_text_indicators = !s_text_indicators;
+    persist_write_bool(PERSIST_KEY_TEXT_INDICATORS, s_text_indicators);
+    layer_mark_dirty(s_canvas_layer);
+
+    // Brief vibration to confirm the toggle
+    static const uint32_t toggle_vibe[] = { 50 };
+    VibePattern pat = { .durations = toggle_vibe, .num_segments = 1 };
+    vibes_enqueue_custom_pattern(pat);
+}
+
+// ---------------------------------------------------------------------------
 // Window Handlers
 // ---------------------------------------------------------------------------
 
@@ -1007,6 +1028,9 @@ static void init(void) {
 
     // Subscribe to wakeup events for background refresh
     wakeup_service_subscribe(wakeup_handler);
+
+    // Subscribe to tap events — toggle simple mode on wrist tap
+    accel_tap_service_subscribe(tap_handler);
 
     // Check if the app was launched by a scheduled wakeup
     if (launch_reason() == APP_LAUNCH_WAKEUP) {

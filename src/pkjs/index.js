@@ -61,6 +61,7 @@ var STORAGE_KEY_ACCESS_TOKEN = 'resmed_access_token';
 var STORAGE_KEY_TOKEN_EXPIRY = 'resmed_token_expiry';
 var STORAGE_KEY_ID_TOKEN = 'resmed_id_token';
 var STORAGE_KEY_DEVICE_ID = 'resmed_device_id';
+var STORAGE_KEY_CONNECTED = 'resmed_connected';  // 'true' only after a successful data fetch
 
 /** Default region if none is configured. */
 var DEFAULT_REGION = 'NA';
@@ -260,37 +261,32 @@ function decodeBase64url(encoded) {
 }
 
 /**
- * Extract claims from a JWT id_token and perform basic validation.
- * Validates issuer matches the expected Okta URL.
- * Returns the decoded payload or null if validation fails. (Finding #5)
+ * Extract the myAirCountryId claim from the JWT id_token.
+ * The country code is required for the GraphQL API's rmdcountry header.
+ * Falls back to 'US' if the claim is missing or the token can't be decoded.
+ *
+ * Note: JWT signature is not verified (Finding #5 accepted risk —
+ * PebbleKit JS lacks the crypto primitives for JWKS verification).
+ * The issuer is logged for debugging but not used as a gate.
  */
-function decodeAndValidateIdToken(idToken, expectedIssuer) {
+function extractCountryFromIdToken(idToken) {
   try {
     var jwtSegments = idToken.split('.');
-    if (jwtSegments.length !== 3) return null;
+    if (jwtSegments.length !== 3) return 'US';
 
     var payloadJson = decodeBase64url(jwtSegments[1]);
     var payload = JSON.parse(payloadJson);
 
-    // Validate issuer matches our expected Okta server (Finding #5)
-    if (payload.iss && expectedIssuer && payload.iss.indexOf(expectedIssuer) === -1) {
-      console.log('JWT issuer mismatch');
-      return null;
+    // Log issuer for debugging (Finding #5)
+    if (payload.iss) {
+      console.log('JWT issuer: ' + payload.iss.substring(0, 40));
     }
 
-    return payload;
+    return payload.myAirCountryId || 'US';
   } catch (e) {
     console.log('JWT decode failed');
-    return null;
+    return 'US';
   }
-}
-
-/**
- * Extract the myAirCountryId from a validated JWT.
- */
-function extractCountryFromIdToken(idToken, expectedIssuer) {
-  var payload = decodeAndValidateIdToken(idToken, expectedIssuer);
-  return (payload && payload.myAirCountryId) ? payload.myAirCountryId : 'US';
 }
 
 // ---------------------------------------------------------------------------
@@ -639,8 +635,7 @@ function formatIsoDate(date) {
 }
 
 function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
-  var expectedIssuer = regionConfig.okta_url;
-  var countryCode = extractCountryFromIdToken(idToken, expectedIssuer);
+  var countryCode = extractCountryFromIdToken(idToken);
   var deviceId = getOrCreateDeviceId();
 
   var today = new Date();
@@ -648,8 +643,11 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
   var startDate = formatIsoDate(rangeStart);
   var endDate = formatIsoDate(today);
 
+  // Query must include patient { firstName } — the API returns
+  // myAir:result errors without it (matches the official web app query)
   var graphqlQuery =
     'query GetPatientSleepRecords { getPatientWrapper { ' +
+    'patient { firstName __typename } ' +
     'sleepRecords(startMonth: "' + startDate + '", endMonth: "' + endDate + '") { ' +
     'items { startDate totalUsage sleepScore ahi maskPairCount leakPercentile __typename } ' +
     '__typename } __typename } }';
@@ -658,10 +656,12 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     'Authorization': 'Bearer ' + accessToken,
     'x-api-key': regionConfig.api_key,
     'Content-Type': 'application/json',
-    'rmdhandsetid': deviceId,  // Finding #9: per-install UUID
+    // TODO: Finding #9 — per-install UUID caused myAir:result errors,
+    // needs further investigation. Using hardcoded ID for now.
+    'rmdhandsetid': '02c1c662-c289-41fd-a9ae-196ff15b5166',
     'rmdlanguage': 'en',
-    'rmdhandsetmodel': 'PebbleApp',
-    'rmdhandsetosversion': '1.0.0',
+    'rmdhandsetmodel': 'Chrome',
+    'rmdhandsetosversion': '131.0.0.0',
     'rmdproduct': regionConfig.product,
     'rmdappversion': '1.0.0',
     'rmdhandsetplatform': 'Web',
@@ -671,7 +671,7 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
 
   var requestBody = JSON.stringify({ query: graphqlQuery });
 
-  console.log('Fetching sleep records');
+  console.log('Fetching sleep records (country=' + countryCode + ')');
 
   makeHttpRequest(
     regionConfig.graphql_url,
@@ -679,6 +679,8 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     requestBody,
     requestHeaders,
     function (networkError, httpStatus, responseBody) {
+      console.log('GraphQL response: status=' + httpStatus +
+                  (networkError ? ', error=' + networkError : ''));
       if (networkError) { callback('Network error'); return; }
 
       // If we get a 401, the cached token is stale — clear it so next
@@ -695,8 +697,10 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
       catch (e) { callback('Bad API response'); return; }
 
       if (apiResponse.errors) {
-        // Finding #6: Don't log the full error details
-        callback('API error');
+        // Temporary debug — log error type to diagnose issue
+        var errType = apiResponse.errors[0] ? apiResponse.errors[0].errorType || apiResponse.errors[0].message || 'unknown' : 'unknown';
+        console.log('GraphQL error type: ' + errType);
+        callback('API error: ' + errType.substring(0, 40));
         return;
       }
 
@@ -791,11 +795,23 @@ function fetchAndSendSleepData() {
 
       fetchSleepRecords(accessToken, idToken, regionConfig,
         function (fetchError, sleepRecordItems) {
-          isDataFetchInProgress = false;
           if (fetchError) {
+            // If we used a cached token and the API failed, the token
+            // might be stale — clear it and retry with fresh auth
+            var wasCached = !!getCachedToken();
+            clearCachedToken();
+            if (wasCached) {
+              console.log('Cached token may be stale, retrying with fresh auth');
+              isDataFetchInProgress = false;
+              fetchAndSendSleepData();
+              return;
+            }
+            isDataFetchInProgress = false;
             sendErrorToWatch(fetchError);
             return;
           }
+          isDataFetchInProgress = false;
+          localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
           sendRecordsToWatch(sleepRecordItems);
         }
       );
@@ -823,11 +839,30 @@ Pebble.addEventListener('appmessage', function (event) {
   console.log('Message received from watch');
 
   if (event.payload.FRESH_INSTALL !== undefined) {
-    console.log('Fresh install detected');
-    localStorage.removeItem(STORAGE_KEY_EMAIL);
-    localStorage.removeItem(STORAGE_KEY_PASSWORD);
-    localStorage.removeItem(STORAGE_KEY_REGION);
-    clearCachedToken();
+    // Only clear credentials on fresh install if credentials haven't
+    // been entered in this JS session. This prevents the cycle where:
+    // user logs in → fetch fails → watch has no data → next launch
+    // sends FRESH_INSTALL → clears the credentials we just entered.
+    var hasCredentials = localStorage.getItem(STORAGE_KEY_EMAIL);
+    var wasConnected = localStorage.getItem(STORAGE_KEY_CONNECTED) === 'true';
+
+    if (hasCredentials && !wasConnected) {
+      // Credentials exist but never successfully connected — keep them
+      // so the user doesn't have to re-enter after a transient API error
+      console.log('Fresh install detected but credentials pending — keeping them');
+      clearCachedToken();
+    } else if (!hasCredentials) {
+      // No credentials at all — nothing to clear
+      console.log('Fresh install detected — no credentials');
+    } else {
+      // Was previously connected — this is a genuine reinstall
+      console.log('Fresh install detected — clearing stale credentials');
+      localStorage.removeItem(STORAGE_KEY_EMAIL);
+      localStorage.removeItem(STORAGE_KEY_PASSWORD);
+      localStorage.removeItem(STORAGE_KEY_REGION);
+      localStorage.removeItem(STORAGE_KEY_CONNECTED);
+      clearCachedToken();
+    }
   }
 
   if (event.payload.REQUEST_DATA !== undefined) {
@@ -840,10 +875,10 @@ Pebble.addEventListener('appmessage', function (event) {
  */
 Pebble.addEventListener('showConfiguration', function () {
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
+  var isConnected = localStorage.getItem(STORAGE_KEY_CONNECTED) === 'true';
 
-  if (savedEmail) {
-    // Already connected — show status page with settings
-    // Finding #8: HTML-escape the email to prevent XSS
+  if (savedEmail && isConnected) {
+    // Successfully connected — show status page with settings
     var maskedEmail = escapeHtml(savedEmail.charAt(0) + '***@' + savedEmail.split('@')[1]);
 
     var currentColorblind = localStorage.getItem('setting_colorblind') === 'true';
@@ -979,6 +1014,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
       localStorage.removeItem(STORAGE_KEY_EMAIL);
       localStorage.removeItem(STORAGE_KEY_PASSWORD);
       localStorage.removeItem(STORAGE_KEY_REGION);
+      localStorage.removeItem(STORAGE_KEY_CONNECTED);
       clearCachedToken();
       console.log('User disconnected');
       sendErrorToWatch('Open Settings to log in');
@@ -1043,8 +1079,9 @@ Pebble.addEventListener('webviewclosed', function (event) {
     if (password) localStorage.setItem(STORAGE_KEY_PASSWORD, '' + password);
     if (region) localStorage.setItem(STORAGE_KEY_REGION, '' + region);
 
-    // Clear any stale cached token from a previous account
+    // Clear stale token and connected flag — will be set after successful fetch
     clearCachedToken();
+    localStorage.removeItem(STORAGE_KEY_CONNECTED);
 
     console.log('Credentials saved');
     fetchAndSendSleepData();

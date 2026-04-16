@@ -801,6 +801,11 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
             snprintf(s_error_message, sizeof(s_error_message), "%s",
                      error_tuple->value->cstring);
             s_app_state = STATE_ERROR;
+            // Brief vibration to alert user since the phone has no error UI
+            // Custom pattern: 100ms buzz (shorter than vibes_short_pulse's 200ms)
+            static const uint32_t error_vibe[] = { 100 };
+            VibePattern pat = { .durations = error_vibe, .num_segments = 1 };
+            vibes_enqueue_custom_pattern(pat);
         }
         layer_mark_dirty(s_canvas_layer);
         return;

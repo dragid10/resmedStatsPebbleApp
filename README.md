@@ -1,6 +1,10 @@
 # ResMed Stats for Pebble
 
+[![Pebble App Store](https://img.shields.io/badge/Pebble-App%20Store-orange)](https://apps.repebble.com/bca44cfa4de14135915afbec)
+
 A Pebble smartwatch app that connects to your ResMed myAir account and displays your CPAP sleep therapy stats for the past week.
+
+**[Install from the Pebble App Store](https://apps.repebble.com/bca44cfa4de14135915afbec)**
 
 ## Features
 

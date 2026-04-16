@@ -806,7 +806,41 @@ function fetchAndSendSleepData() {
 // Pebble Event Listeners
 // ---------------------------------------------------------------------------
 
+// MOCK_MODE: set to true to send fake data for screenshots, false for production
+var MOCK_MODE = false;
+
+function sendMockData() {
+  var mockRecords = [
+    { date: 'Apr 15', score: 92, ahi: 8,  usage: 452, mask: 1, leak: 8  },
+    { date: 'Apr 14', score: 85, ahi: 12, usage: 421, mask: 0, leak: 12 },
+    { date: 'Apr 13', score: 78, ahi: 23, usage: 398, mask: 2, leak: 18 },
+    { date: 'Apr 12', score: 88, ahi: 5,  usage: 445, mask: 1, leak: 6  },
+    { date: 'Apr 11', score: 45, ahi: 32, usage: 180, mask: 4, leak: 35 },
+    { date: 'Apr 10', score: 95, ahi: 3,  usage: 480, mask: 0, leak: 4  },
+    { date: 'Apr 9',  score: 0,  ahi: 0,  usage: 0,   mask: 0, leak: 0  },
+  ];
+
+  enqueueWatchMessage({ 'TOTAL_DAYS': mockRecords.length });
+  for (var i = 0; i < mockRecords.length; i++) {
+    var r = mockRecords[i];
+    enqueueWatchMessage({
+      'DAY_INDEX': i,
+      'RECORD_DATE': r.date,
+      'SLEEP_SCORE': r.score,
+      'AHI_X10': r.ahi,
+      'USAGE_MINS': r.usage,
+      'MASK_COUNT': r.mask,
+      'LEAK_PCT': r.leak
+    });
+  }
+  enqueueWatchMessage({ 'DATA_COMPLETE': 1 });
+}
+
 Pebble.addEventListener('ready', function () {
+  if (MOCK_MODE) {
+    sendMockData();
+    return;
+  }
 
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
   if (savedEmail) {

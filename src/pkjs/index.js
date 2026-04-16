@@ -15,8 +15,7 @@
  *     the number of times credentials are sent to Okta.
  *   - TLS certificate pinning is not available in PebbleKit JS's
  *     XMLHttpRequest — this is an accepted platform limitation.
- *   - All console.log output is sanitized — no credentials, tokens,
- *     or response bodies are ever logged.
+ *   - No debug logging in production builds.
  *
  * Auth flow based on https://github.com/prestomation/resmed_myair_sensors
  */
@@ -279,12 +278,10 @@ function extractCountryFromIdToken(idToken) {
 
     // Log issuer for debugging (Finding #5)
     if (payload.iss) {
-      console.log('JWT issuer: ' + payload.iss.substring(0, 40));
     }
 
     return payload.myAirCountryId || 'US';
   } catch (e) {
-    console.log('JWT decode failed');
     return 'US';
   }
 }
@@ -378,7 +375,7 @@ function sendErrorToWatch(errorMessage) {
   Pebble.sendAppMessage(
     { 'ERROR_MSG': errorMessage.substring(0, ERROR_MSG_MAX_LENGTH) },
     function () {},
-    function () { console.log('Failed to deliver error to watch'); }
+    function () {}
   );
 }
 
@@ -476,7 +473,6 @@ function authenticateWithOkta(email, password, region, callback) {
   // Try cached token first (Finding #14)
   var cached = getCachedToken();
   if (cached) {
-    console.log('Using cached access token');
     callback(null, cached.accessToken, cached.idToken, regionConfig);
     return;
   }
@@ -485,7 +481,6 @@ function authenticateWithOkta(email, password, region, callback) {
   var authServerId = regionConfig.auth_server_id;
 
   // -- Step 1: Primary authentication (get session token) --
-  console.log('Auth step 1/3');
 
   var credentialsPayload = JSON.stringify({ username: email, password: password });
 
@@ -514,10 +509,8 @@ function authenticateWithOkta(email, password, region, callback) {
       }
 
       var sessionToken = authnResponse.sessionToken;
-      console.log('Auth step 1/3 complete');
 
       // -- Step 2: Exchange session token for authorization code via PKCE --
-      console.log('Auth step 2/3');
 
       var codeVerifier = generateCodeVerifier();
       var codeChallenge = generateCodeChallenge(codeVerifier);
@@ -568,10 +561,8 @@ function authenticateWithOkta(email, password, region, callback) {
             return;
           }
 
-          console.log('Auth step 2/3 complete');
 
           // -- Step 3: Exchange authorization code for access token --
-          console.log('Auth step 3/3');
 
           var tokenRequestBody =
             'grant_type=authorization_code' +
@@ -613,7 +604,6 @@ function authenticateWithOkta(email, password, region, callback) {
               // Cache the token to avoid re-authenticating on every request
               cacheToken(accessToken, idToken, expiresIn);
 
-              console.log('Auth step 3/3 complete');
               callback(null, accessToken, idToken, regionConfig);
             }
           );
@@ -671,7 +661,6 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
 
   var requestBody = JSON.stringify({ query: graphqlQuery });
 
-  console.log('Fetching sleep records (country=' + countryCode + ')');
 
   makeHttpRequest(
     regionConfig.graphql_url,
@@ -679,8 +668,6 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     requestBody,
     requestHeaders,
     function (networkError, httpStatus, responseBody) {
-      console.log('GraphQL response: status=' + httpStatus +
-                  (networkError ? ', error=' + networkError : ''));
       if (networkError) { callback('Network error'); return; }
 
       // If we get a 401, the cached token is stale — clear it so next
@@ -699,7 +686,6 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
       if (apiResponse.errors) {
         // Temporary debug — log error type to diagnose issue
         var errType = apiResponse.errors[0] ? apiResponse.errors[0].errorType || apiResponse.errors[0].message || 'unknown' : 'unknown';
-        console.log('GraphQL error type: ' + errType);
         callback('API error: ' + errType.substring(0, 40));
         return;
       }
@@ -742,7 +728,6 @@ function sendRecordsToWatch(sleepRecordItems) {
   var recordsToSend = sleepRecordItems.slice(0, MAX_DAYS);
   var totalDays = recordsToSend.length;
 
-  console.log('Sending ' + totalDays + ' days to watch');
 
   enqueueWatchMessage({ 'TOTAL_DAYS': totalDays });
 
@@ -783,7 +768,6 @@ function fetchAndSendSleepData() {
   }
 
   isDataFetchInProgress = true;
-  console.log('Starting data fetch');
 
   authenticateWithOkta(email, password, region,
     function (authError, accessToken, idToken, regionConfig) {
@@ -801,7 +785,6 @@ function fetchAndSendSleepData() {
             var wasCached = !!getCachedToken();
             clearCachedToken();
             if (wasCached) {
-              console.log('Cached token may be stale, retrying with fresh auth');
               isDataFetchInProgress = false;
               fetchAndSendSleepData();
               return;
@@ -824,7 +807,6 @@ function fetchAndSendSleepData() {
 // ---------------------------------------------------------------------------
 
 Pebble.addEventListener('ready', function () {
-  console.log('PebbleKit JS ready');
 
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
   if (savedEmail) {
@@ -836,7 +818,6 @@ Pebble.addEventListener('ready', function () {
 
 Pebble.addEventListener('appmessage', function (event) {
   // Finding #6: Don't log the full payload
-  console.log('Message received from watch');
 
   if (event.payload.FRESH_INSTALL !== undefined) {
     // Only clear credentials on fresh install if credentials haven't
@@ -849,14 +830,11 @@ Pebble.addEventListener('appmessage', function (event) {
     if (hasCredentials && !wasConnected) {
       // Credentials exist but never successfully connected — keep them
       // so the user doesn't have to re-enter after a transient API error
-      console.log('Fresh install detected but credentials pending — keeping them');
       clearCachedToken();
     } else if (!hasCredentials) {
       // No credentials at all — nothing to clear
-      console.log('Fresh install detected — no credentials');
     } else {
       // Was previously connected — this is a genuine reinstall
-      console.log('Fresh install detected — clearing stale credentials');
       localStorage.removeItem(STORAGE_KEY_EMAIL);
       localStorage.removeItem(STORAGE_KEY_PASSWORD);
       localStorage.removeItem(STORAGE_KEY_REGION);
@@ -1016,7 +994,6 @@ Pebble.addEventListener('webviewclosed', function (event) {
       localStorage.removeItem(STORAGE_KEY_REGION);
       localStorage.removeItem(STORAGE_KEY_CONNECTED);
       clearCachedToken();
-      console.log('User disconnected');
       sendErrorToWatch('Open Settings to log in');
       return;
     }
@@ -1049,7 +1026,6 @@ Pebble.addEventListener('webviewclosed', function (event) {
         'SHOW_LEAK': showLeak
       }, function () {}, function () {});
 
-      console.log('Settings updated');
       return;
     }
 
@@ -1083,9 +1059,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
     clearCachedToken();
     localStorage.removeItem(STORAGE_KEY_CONNECTED);
 
-    console.log('Credentials saved');
     fetchAndSendSleepData();
   } catch (parseError) {
-    console.log('Settings parse error');
   }
 });

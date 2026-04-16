@@ -855,8 +855,6 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         persist_write_int(PERSIST_KEY_VISIBLE_STATS, mask);
 
         layer_mark_dirty(s_canvas_layer);
-        APP_LOG(APP_LOG_LEVEL_INFO, "Settings: colorblind=%d, sync=%dh, stats=%d",
-                s_colorblind_mode, s_sync_interval_hours, mask);
         return;
     }
 
@@ -945,7 +943,7 @@ static void outbox_failed_handler(DictionaryIterator *iterator,
 }
 
 static void outbox_sent_handler(DictionaryIterator *iterator, void *context) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "AppMessage outbox send succeeded");
+    // No-op — success is the expected path
 }
 
 // ---------------------------------------------------------------------------

@@ -625,13 +625,13 @@ test('a rejected refresh token falls back to a full login', function () {
   assert.deepEqual(env.errorsSent(), ['Login failed (401)']);
 });
 
-test('NA logins do not ask for a refresh token', function () {
+test('NA logins also ask for a refresh token', function () {
   var env = h.loadApp({ storage: h.CREDENTIALS, routes: h.oktaLoginRoutes().concat([
     { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
   ]) });
   env.app.fetchAndSendSleepData();
   var authorize = env.requests.filter(function (r) { return /authorize/.test(r.url); })[0];
-  assert.doesNotMatch(authorize.url, /offline_access/);
+  assert.match(authorize.url, /offline_access/);
 });
 
 test('with the password dropped, a rejected refresh token asks the user to log in again', function () {
@@ -648,13 +648,37 @@ test('with the password dropped, a rejected refresh token asks the user to log i
   assert.equal(env.storage.resmed_connected, undefined);
 });
 
-test('NA keeps the password since it has no refresh token', function () {
+test('the password is kept when Okta returns no refresh token', function () {
   var env = h.loadApp({ storage: h.CREDENTIALS, routes: h.oktaLoginRoutes().concat([
     { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
   ]) });
   env.app.fetchAndSendSleepData();
   assert.equal(env.storage.resmed_password, 'hunter2');
   assert.equal(env.storage.resmed_refresh_token, undefined);
+});
+
+test('an NA refresh token replaces the password and renews the login', function () {
+  var routes = h.oktaLoginRoutes();
+  routes[2] = { match: /\/v1\/token$/, respond: function (req) {
+    if (/grant_type=refresh_token/.test(req.body)) {
+      return { status: 200, body: JSON.stringify({ access_token: 'refreshed', refresh_token: 'rt-2', expires_in: 3600 }) };
+    }
+    return { status: 200, body: JSON.stringify({
+      access_token: 'fresh-token', id_token: 'a.b.c', refresh_token: 'rt-1', expires_in: 3600
+    }) };
+  } };
+  var env = h.loadApp({ storage: h.CREDENTIALS, routes: routes.concat([
+    { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
+  ]) });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.storage.resmed_password, undefined);
+
+  env.storage.resmed_token_expiry = String(Date.now() - 1);
+  var before = env.requests.length;
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(urlsHit({ requests: env.requests.slice(before) }),
+    ['/oauth2/aus4ccsxvnidQgLmA297/v1/token', '/graphql']);
+  assert.equal(env.storage.resmed_refresh_token, 'rt-2');
 });
 
 test('an expired code challenge is deleted from storage', function () {

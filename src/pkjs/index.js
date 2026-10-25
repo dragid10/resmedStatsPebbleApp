@@ -113,10 +113,7 @@ var REGION_CONFIG = {
     api_key: 'da2-o66oo6xdnfh5hlfuw5yw5g2dtm',
     graphql_url: 'https://graphql.hyperdrive.resmed.eu/graphql',
     redirect_url: 'https://myair.resmed.eu',
-    product: 'myAir EU',
-    // EU logins need an emailed code each time, so keep a refresh token
-    // to get new access tokens without logging in again
-    use_refresh_token: true
+    product: 'myAir EU'
   }
 };
 
@@ -502,16 +499,17 @@ function authenticateWithOkta(email, password, region, interactive, callback) {
     return;
   }
 
-  var refreshToken = regionConfig.use_refresh_token &&
-    localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN);
+  // A refresh token renews the login without the password (or, for EU,
+  // a new emailed code)
+  var refreshToken = localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN);
   if (refreshToken) {
     refreshAccessToken(refreshToken, regionConfig, function (refreshError, accessToken, idToken) {
       if (!refreshError) { callback(null, accessToken, idToken, regionConfig); return; }
       if (refreshError !== 'Refresh rejected') { callback(refreshError); return; }
       clearRefreshToken();
       if (!password) {
-        // The password was deleted once the refresh token worked; the user
-        // has to log in again (with a new emailed code anyway)
+        // The password was deleted once the refresh token worked, so the
+        // user has to log in again
         localStorage.removeItem(STORAGE_KEY_CONNECTED);
         callback(MSG_LOGIN_AGAIN);
         return;
@@ -753,8 +751,7 @@ function exchangeSessionToken(sessionToken, regionConfig, callback) {
   var authorizeUrl = oktaBaseUrl + '/oauth2/' + authServerId + '/v1/authorize?' +
     'client_id=' + encodeURIComponent(regionConfig.client_id) +
     '&response_type=code' +
-    '&scope=' + encodeURIComponent('openid profile email' +
-      (regionConfig.use_refresh_token ? ' offline_access' : '')) +
+    '&scope=' + encodeURIComponent('openid profile email offline_access') +
     '&redirect_uri=' + encodeURIComponent(regionConfig.redirect_url) +
     '&state=' + encodeURIComponent(oauthState) +
     '&code_challenge_method=S256' +
@@ -847,10 +844,10 @@ function handleTokenResponse(responseBody, regionConfig, callback) {
 
   // Cache the token to avoid re-authenticating on every request
   cacheToken(accessToken, idToken, expiresIn);
-  if (regionConfig.use_refresh_token && tokenResponse.refresh_token) {
+  if (tokenResponse.refresh_token) {
     localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, tokenResponse.refresh_token);
-    // The refresh token replaces the password from here on: a password
-    // login would need a new emailed code anyway, so don't keep it
+    // The refresh token replaces the password from here on, so don't keep
+    // it on the phone (Security audit finding #1)
     localStorage.removeItem(STORAGE_KEY_PASSWORD);
   }
 
@@ -1084,8 +1081,7 @@ function fetchAndSendSleepData(restart) {
   var password = localStorage.getItem(STORAGE_KEY_PASSWORD);
   var region = localStorage.getItem(STORAGE_KEY_REGION) || DEFAULT_REGION;
 
-  var canRefresh = !!(REGION_CONFIG[region] && REGION_CONFIG[region].use_refresh_token &&
-    localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN));
+  var canRefresh = !!localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN);
   if (!email || (!password && !canRefresh)) {
     sendErrorToWatch(MSG_LOGIN_AGAIN);
     return;

@@ -194,6 +194,7 @@ static int s_current_day_index = 0;      // Currently displayed day (0 = most re
 // -- App State --
 static AppState s_app_state = STATE_LOADING;
 static char s_error_message[ERROR_MSG_MAX_LEN];
+static bool s_error_is_cooldown = false;      // Error screen is the manual-sync cooldown
 static char s_last_sync_time[SYNC_TIME_MAX_LEN];
 
 // -- Loading Animation --
@@ -644,7 +645,11 @@ static void draw_error_screen(GContext *ctx, GRect bounds) {
         GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
     graphics_context_set_text_color(ctx, COLOR_HINT);
-    graphics_draw_text(ctx, "SELECT to retry",
+    // During the cooldown a short press only repeats this message, so
+    // point at the long press that bypasses it
+    const char *hint = s_error_is_cooldown ? "Hold SELECT to force sync"
+                                           : "SELECT to retry";
+    graphics_draw_text(ctx, hint,
         fonts_get_system_font(FONT_KEY_GOTHIC_14),
         GRect(0, bounds.size.h / 2 + 30, bounds.size.w, 18),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
@@ -795,6 +800,7 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
             int mins_remaining = (MANUAL_SYNC_COOLDOWN_SECS - seconds_since_sync) / 60 + 1;
             snprintf(s_error_message, sizeof(s_error_message),
                      "Synced recently.\nRetry in %d min.", mins_remaining);
+            s_error_is_cooldown = true;
             s_app_state = STATE_ERROR;
             layer_mark_dirty(s_canvas_layer);
             return;
@@ -859,6 +865,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         } else {
             snprintf(s_error_message, sizeof(s_error_message), "%s",
                      error_tuple->value->cstring);
+            s_error_is_cooldown = false;
             s_app_state = STATE_ERROR;
             // Brief vibration to alert user since the phone has no error UI,
             // but stay quiet during an unattended wakeup refresh.

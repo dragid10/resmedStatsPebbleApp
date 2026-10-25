@@ -64,6 +64,9 @@ var STORAGE_KEY_CONNECTED = 'resmed_connected';  // 'true' only after a successf
 var STORAGE_KEY_MFA = 'resmed_mfa_pending';       // JSON: email-code login waiting for a code
 var STORAGE_KEY_REFRESH_TOKEN = 'resmed_refresh_token';
 
+/** Error that sends the watch to its "set up on your phone" screen. */
+var MSG_LOGIN_AGAIN = 'Open Settings to log in';
+
 /** Error for an account whose login works but has no CPAP machine linked. */
 var MSG_NO_DEVICE = 'No CPAP machine linked to this myAir account';
 
@@ -506,6 +509,13 @@ function authenticateWithOkta(email, password, region, interactive, callback) {
       if (!refreshError) { callback(null, accessToken, idToken, regionConfig); return; }
       if (refreshError !== 'Refresh rejected') { callback(refreshError); return; }
       clearRefreshToken();
+      if (!password) {
+        // The password was deleted once the refresh token worked; the user
+        // has to log in again (with a new emailed code anyway)
+        localStorage.removeItem(STORAGE_KEY_CONNECTED);
+        callback(MSG_LOGIN_AGAIN);
+        return;
+      }
       authenticateWithOkta(email, password, region, interactive, callback);
     });
     return;
@@ -616,6 +626,8 @@ function getPendingMfa() {
       return pending;
     }
   } catch (e) {}
+  // Don't keep an expired or unreadable challenge around
+  clearPendingMfa();
   return null;
 }
 
@@ -837,6 +849,9 @@ function handleTokenResponse(responseBody, regionConfig, callback) {
   cacheToken(accessToken, idToken, expiresIn);
   if (regionConfig.use_refresh_token && tokenResponse.refresh_token) {
     localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, tokenResponse.refresh_token);
+    // The refresh token replaces the password from here on: a password
+    // login would need a new emailed code anyway, so don't keep it
+    localStorage.removeItem(STORAGE_KEY_PASSWORD);
   }
 
   callback(null, accessToken, idToken, regionConfig);
@@ -1042,6 +1057,7 @@ function isPermanentFetchError(message) {
     message === 'Invalid region' ||
     message === 'No CPAP data found' ||
     message === MSG_NO_DEVICE ||
+    message === MSG_LOGIN_AGAIN ||
     message.indexOf('MFA') === 0 ||
     message.indexOf('Account locked') === 0 ||
     message.indexOf('Password expired') === 0 ||
@@ -1068,8 +1084,10 @@ function fetchAndSendSleepData(restart) {
   var password = localStorage.getItem(STORAGE_KEY_PASSWORD);
   var region = localStorage.getItem(STORAGE_KEY_REGION) || DEFAULT_REGION;
 
-  if (!email || !password) {
-    sendErrorToWatch('Open Settings to log in');
+  var canRefresh = !!(REGION_CONFIG[region] && REGION_CONFIG[region].use_refresh_token &&
+    localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN));
+  if (!email || (!password && !canRefresh)) {
+    sendErrorToWatch(MSG_LOGIN_AGAIN);
     return;
   }
 

@@ -601,6 +601,7 @@ test('EU logins keep a refresh token and use it instead of a new emailed code', 
   assert.match(env.requests.filter(function (r) { return /authorize/.test(r.url); })[0].url,
     /scope=openid%20profile%20email%20offline_access/);
   assert.equal(env.storage.resmed_refresh_token, 'rt-1');
+  assert.equal(env.storage.resmed_password, undefined, 'password is dropped once a refresh token works');
 
   // Access token expires: the next refresh uses the refresh token, no authn
   env.storage.resmed_token_expiry = String(Date.now() - 1);
@@ -631,4 +632,35 @@ test('NA logins do not ask for a refresh token', function () {
   env.app.fetchAndSendSleepData();
   var authorize = env.requests.filter(function (r) { return /authorize/.test(r.url); })[0];
   assert.doesNotMatch(authorize.url, /offline_access/);
+});
+
+test('with the password dropped, a rejected refresh token asks the user to log in again', function () {
+  var env = h.loadApp({
+    storage: { resmed_email: 'alex@example.com', resmed_region: 'EU',
+               resmed_refresh_token: 'old', resmed_connected: 'true' },
+    routes: [{ match: /\/v1\/token$/, respond: function () { return { status: 400, body: '{}' }; } }]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.requests.length, 1);
+  assert.equal(env.timers.length, 0);
+  assert.deepEqual(env.errorsSent(), ['Open Settings to log in']);
+  assert.equal(env.storage.resmed_refresh_token, undefined);
+  assert.equal(env.storage.resmed_connected, undefined);
+});
+
+test('NA keeps the password since it has no refresh token', function () {
+  var env = h.loadApp({ storage: h.CREDENTIALS, routes: h.oktaLoginRoutes().concat([
+    { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
+  ]) });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.storage.resmed_password, 'hunter2');
+  assert.equal(env.storage.resmed_refresh_token, undefined);
+});
+
+test('an expired code challenge is deleted from storage', function () {
+  var env = h.loadApp({ storage: { resmed_mfa_pending: JSON.stringify({
+    stateToken: 'st-1', verifyUrl: VERIFY_URL, expiresAt: Date.now() - 1, codeSent: true
+  }) } });
+  assert.equal(env.app.getPendingMfa(), null);
+  assert.equal(env.storage.resmed_mfa_pending, undefined);
 });

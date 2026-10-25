@@ -16,6 +16,7 @@
  */
 
 #include <pebble.h>
+#include "stats_logic.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -131,32 +132,7 @@
 #define COLOR_SCORE_BAD    PBL_IF_COLOR_ELSE(GColorRed, GColorWhite)
 #define COLOR_LOADING      PBL_IF_COLOR_ELSE(GColorPictonBlue, GColorWhite)
 
-// -- Clinical Thresholds --
-
-/** myAir score >= this is considered good (green). */
-#define SCORE_GOOD_THRESHOLD 70
-
-/** myAir score >= this is considered okay (yellow). Below is bad (red). */
-#define SCORE_OK_THRESHOLD 50
-
-/**
- * AHI thresholds (stored as AHI × 10 to avoid floats).
- * < 5.0 events/hr (50) = normal, 5-15 (150) = mild, >15 = moderate/severe.
- */
-#define AHI_NORMAL_THRESHOLD_X10 50
-#define AHI_MILD_THRESHOLD_X10   150
-
-/** Usage >= 7 hours (420 min) is good, >= 4 hours (240 min) is okay. */
-#define USAGE_GOOD_THRESHOLD_MINS 420
-#define USAGE_OK_THRESHOLD_MINS   240
-
-/** Mask off: 0-1 removals is good, 2-3 is okay, 4+ is high. */
-#define MASK_GOOD_THRESHOLD 2
-#define MASK_OK_THRESHOLD   4
-
-/** Leak: <20% is good, 20-40% is okay, >40% is high. */
-#define LEAK_GOOD_THRESHOLD 20
-#define LEAK_OK_THRESHOLD   40
+// Clinical thresholds live in stats_logic.h.
 
 // ---------------------------------------------------------------------------
 // Data Structures
@@ -226,42 +202,17 @@ static AppTimer *s_wakeup_exit_timer = NULL;
 static time_t s_last_sync_epoch = 0;           // Unix timestamp of last successful sync
 
 // ---------------------------------------------------------------------------
-// Utility — Bounds clamping for safe int32 → int16_t conversion (Finding #13)
-// ---------------------------------------------------------------------------
-
-/** Clamp a 32-bit value to a valid int16_t range. */
-static int16_t clamp_int16(int32_t value, int16_t min_val, int16_t max_val) {
-    if (value < min_val) return min_val;
-    if (value > max_val) return max_val;
-    return (int16_t)value;
-}
-
-// ---------------------------------------------------------------------------
 // Color Helpers — Map clinical values to color-coded indicators
 // ---------------------------------------------------------------------------
 
-/** Returns color-coded indicator for the myAir sleep score. */
-static GColor get_score_color(int score) {
+/** Map a clinical level to its indicator color (plain white when colorblind). */
+static GColor get_level_color(StatLevel level) {
     if (s_colorblind_mode) return COLOR_VALUE;
-    if (score >= SCORE_GOOD_THRESHOLD) return COLOR_SCORE_GOOD;
-    if (score >= SCORE_OK_THRESHOLD) return COLOR_SCORE_OK;
-    return COLOR_SCORE_BAD;
-}
-
-/** Returns color-coded indicator for the AHI value (×10). */
-static GColor get_ahi_color(int ahi_x10) {
-    if (s_colorblind_mode) return COLOR_VALUE;
-    if (ahi_x10 < AHI_NORMAL_THRESHOLD_X10) return COLOR_SCORE_GOOD;
-    if (ahi_x10 < AHI_MILD_THRESHOLD_X10) return COLOR_SCORE_OK;
-    return COLOR_SCORE_BAD;
-}
-
-/** Returns color-coded indicator for CPAP usage duration. */
-static GColor get_usage_color(int usage_mins) {
-    if (s_colorblind_mode) return COLOR_VALUE;
-    if (usage_mins >= USAGE_GOOD_THRESHOLD_MINS) return COLOR_SCORE_GOOD;
-    if (usage_mins >= USAGE_OK_THRESHOLD_MINS) return COLOR_SCORE_OK;
-    return COLOR_SCORE_BAD;
+    switch (level) {
+        case STAT_GOOD: return COLOR_SCORE_GOOD;
+        case STAT_OK:   return COLOR_SCORE_OK;
+        default:        return COLOR_SCORE_BAD;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +277,7 @@ static void schedule_next_wakeup(void) {
     local_time->tm_hour = WAKEUP_HOUR;
     local_time->tm_min = 0;
     local_time->tm_sec = 0;
-    time_t next_wakeup_time = mktime(local_time);
-    if (next_wakeup_time <= now + 60) {
-        next_wakeup_time += 24 * 3600;
-    }
+    time_t next_wakeup_time = next_daily_wakeup(now, mktime(local_time));
 
     // Another app may hold a wakeup within a minute of ours; nudge later
     for (int attempt = 0; attempt < 5; attempt++) {
@@ -396,40 +344,7 @@ static void send_data_request(void) {
 // All positions are computed from screen bounds so the layout adapts
 // to any Pebble screen size (144x168 through 200x228).
 
-// -- Text indicators --
-// When enabled, these REPLACE numeric values with human-readable
-// interpretations like "Good", "OK", "Poor" — for users who don't
-// care about the exact numbers.
-
-static const char* get_score_text(int score) {
-    if (score >= SCORE_GOOD_THRESHOLD) return "Good";
-    if (score >= SCORE_OK_THRESHOLD) return "OK";
-    return "Poor";
-}
-
-static const char* get_ahi_text(int ahi_x10) {
-    if (ahi_x10 < AHI_NORMAL_THRESHOLD_X10) return "Good";
-    if (ahi_x10 < AHI_MILD_THRESHOLD_X10) return "Mild";
-    return "High";
-}
-
-static const char* get_usage_text(int usage_mins) {
-    if (usage_mins >= USAGE_GOOD_THRESHOLD_MINS) return "Good";
-    if (usage_mins >= USAGE_OK_THRESHOLD_MINS) return "OK";
-    return "Low";
-}
-
-static const char* get_mask_text(int mask_count) {
-    if (mask_count < MASK_GOOD_THRESHOLD) return "Good";
-    if (mask_count < MASK_OK_THRESHOLD) return "OK";
-    return "High";
-}
-
-static const char* get_leak_text(int leak_pct) {
-    if (leak_pct < LEAK_GOOD_THRESHOLD) return "Good";
-    if (leak_pct < LEAK_OK_THRESHOLD) return "OK";
-    return "High";
-}
+// Text indicator strings ("Good"/"OK"/"Poor") come from stats_logic.c.
 
 /** Draw the header bar with date and day counter. */
 static void draw_header(GContext *ctx, GRect bounds, SleepRecord *record) {
@@ -505,7 +420,7 @@ static void draw_score_hero(GContext *ctx, GRect bounds, SleepRecord *record) {
         score_y = H * 15 / 100;
     }
 
-    graphics_context_set_text_color(ctx, get_score_color(record->sleep_score));
+    graphics_context_set_text_color(ctx, get_level_color(score_level(record->sleep_score)));
     graphics_draw_text(ctx, score_num, score_font,
         GRect(0, score_y, W, score_font_h),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
@@ -577,10 +492,8 @@ static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
         snprintf(mask_text, sizeof(mask_text), "%s", get_mask_text(record->mask_count));
         snprintf(leak_text, sizeof(leak_text), "%s", get_leak_text(record->leak_pct));
     } else {
-        snprintf(ahi_text, sizeof(ahi_text), "%d.%d /hr",
-                 record->ahi_x10 / 10, record->ahi_x10 % 10);
-        snprintf(usage_text, sizeof(usage_text), "%dh %02dm",
-                 record->usage_mins / 60, record->usage_mins % 60);
+        format_ahi(ahi_text, sizeof(ahi_text), record->ahi_x10);
+        format_usage(usage_text, sizeof(usage_text), record->usage_mins);
         snprintf(mask_text, sizeof(mask_text), "%d", record->mask_count);
         snprintf(leak_text, sizeof(leak_text), "%d%%", record->leak_pct);
     }
@@ -589,12 +502,12 @@ static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
     int row = 0;
     if (s_show_events) {
         draw_stat_row(ctx, stats_top + row_h * row, W,
-                      "Events", ahi_text, get_ahi_color(record->ahi_x10));
+                      "Events", ahi_text, get_level_color(ahi_level(record->ahi_x10)));
         row++;
     }
     if (s_show_usage) {
         draw_stat_row(ctx, stats_top + row_h * row, W,
-                      "Usage", usage_text, get_usage_color(record->usage_mins));
+                      "Usage", usage_text, get_level_color(usage_level(record->usage_mins)));
         row++;
     }
     if (s_show_mask_off) {
@@ -815,7 +728,7 @@ static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
         return;
     }
     if (s_app_state != STATE_DISPLAY || s_total_days == 0) return;
-    s_current_day_index = (s_current_day_index - 1 + s_total_days) % s_total_days;
+    s_current_day_index = wrap_day_index(s_current_day_index, -1, s_total_days);
     layer_mark_dirty(s_canvas_layer);
 }
 
@@ -828,7 +741,7 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
         return;
     }
     if (s_app_state != STATE_DISPLAY || s_total_days == 0) return;
-    s_current_day_index = (s_current_day_index + 1) % s_total_days;
+    s_current_day_index = wrap_day_index(s_current_day_index, 1, s_total_days);
     layer_mark_dirty(s_canvas_layer);
 }
 
@@ -850,17 +763,15 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
     }
 
     // Rate-limit manual syncs to avoid spamming the API
-    if (s_last_sync_epoch > 0) {
-        time_t seconds_since_sync = time(NULL) - s_last_sync_epoch;
-        if (seconds_since_sync < MANUAL_SYNC_COOLDOWN_SECS) {
-            int mins_remaining = (MANUAL_SYNC_COOLDOWN_SECS - seconds_since_sync) / 60 + 1;
-            snprintf(s_error_message, sizeof(s_error_message),
-                     "Synced recently.\nRetry in %d min.", mins_remaining);
-            s_error_is_cooldown = true;
-            s_app_state = STATE_ERROR;
-            layer_mark_dirty(s_canvas_layer);
-            return;
-        }
+    int mins_remaining = cooldown_minutes_remaining(time(NULL), s_last_sync_epoch,
+                                                    MANUAL_SYNC_COOLDOWN_SECS);
+    if (mins_remaining > 0) {
+        snprintf(s_error_message, sizeof(s_error_message),
+                 "Synced recently.\nRetry in %d min.", mins_remaining);
+        s_error_is_cooldown = true;
+        s_app_state = STATE_ERROR;
+        layer_mark_dirty(s_canvas_layer);
+        return;
     }
 
     enter_loading_state();
@@ -1135,12 +1046,30 @@ static void wakeup_handler(WakeupId id, int32_t reason) {
 // Tap Handler — Double-tap to toggle simple mode
 // ---------------------------------------------------------------------------
 
+static uint64_t s_last_tap_ms = 0;
+
+static uint64_t now_ms(void) {
+    time_t secs;
+    uint16_t ms;
+    time_ms(&secs, &ms);
+    return (uint64_t)secs * 1000 + ms;
+}
+
 /**
- * Accelerometer tap handler. A single shake toggles simple mode
- * (text indicators vs numeric values) without opening phone settings.
+ * Accelerometer tap handler. Two flicks in quick succession toggle simple
+ * mode (text indicators vs numeric values) without opening phone settings;
+ * a single tap is ignored so ordinary arm movement doesn't flip the display.
  */
 static void tap_handler(AccelAxisType axis, int32_t direction) {
     if (s_app_state != STATE_DISPLAY) return;
+
+    uint64_t now = now_ms();
+    if (!is_double_tap(now, s_last_tap_ms)) {
+        s_last_tap_ms = now;
+        return;
+    }
+    // Start fresh so a third tap (or the confirmation buzz) can't toggle again
+    s_last_tap_ms = 0;
 
     s_text_indicators = !s_text_indicators;
     persist_write_bool(PERSIST_KEY_TEXT_INDICATORS, s_text_indicators);

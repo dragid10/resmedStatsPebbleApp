@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "keywords": ["pebble-app"],
   "private": true,
+  "scripts": {
+    "test": "node --test test/pkjs/*.test.js && sh test/c/run.sh"
+  },
   "dependencies": {
     "@rebble/clay": "^1.0.8"
   },

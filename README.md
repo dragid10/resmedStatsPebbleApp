@@ -24,7 +24,7 @@ After logging in, the settings page offers:
 |---------|-------------|
 | **Colorblind Mode** | Monochrome display — all values in white, no color meaning |
 | **Simple Mode** | Replaces numbers with "Good" / "OK" / "Poor" text |
-| **Sync Interval** | How often to auto-refresh (4, 6, 8, or 12 hours) |
+| **Sync Interval** | Refresh on open if cached data is older than this (4, 6, 8, or 12 hours). The app also refreshes itself once a day at 9 AM and closes again on its own. |
 | **Visible Stats** | Toggle which stats appear below the score |
 | **Disconnect** | Clear credentials and log out |
 

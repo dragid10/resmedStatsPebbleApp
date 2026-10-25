@@ -953,7 +953,7 @@ Pebble.addEventListener('showConfiguration', function () {
 
       '<div class="setting-row">' +
       '<div><div class="setting-label">Sync Interval</div>' +
-      '<div class="setting-desc">How often to refresh data</div></div>' +
+      '<div class="setting-desc">Refresh on open if data is older than this</div></div>' +
       '<select id="sync-interval">' +
       '<option value="4"' + (currentSyncInterval === '4' ? ' selected' : '') + '>4 hours</option>' +
       '<option value="6"' + (currentSyncInterval === '6' ? ' selected' : '') + '>6 hours</option>' +

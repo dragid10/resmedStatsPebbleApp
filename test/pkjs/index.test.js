@@ -146,14 +146,100 @@ test('a wrong password is reported right away without retrying', function () {
 
 test('isPermanentFetchError only skips retries for errors a retry cannot fix', function () {
   var env = h.loadApp();
-  ['Login failed', 'Login failed (401)', 'No CPAP data found', 'Rate limited. Try later.',
-   'MFA accounts not yet supported.', 'Invalid region'].forEach(function (msg) {
+  ['Login failed: LOCKED_OUT', 'Login failed (401)', 'No CPAP data found',
+   'Rate limited. Try later.', 'MFA login not supported yet (MFA_ENROLL)',
+   'Account locked. Unlock it on myAir', 'Password expired. Change it on myAir',
+   'Invalid region'].forEach(function (msg) {
     assert.equal(env.app.isPermanentFetchError(msg), true, msg);
   });
   ['Network error', 'Request timeout', 'Session expired. Try again.', 'API error (502)',
-   'Could not get auth code', 'Token error'].forEach(function (msg) {
+   'Could not get auth code', 'Auth code error (500)', 'Token error'].forEach(function (msg) {
     assert.equal(env.app.isPermanentFetchError(msg), false, msg);
   });
+});
+
+test('Okta statuses we cannot complete name the status and are not retried', function () {
+  [['MFA_REQUIRED', 'MFA login not supported yet (MFA_REQUIRED)'],
+   ['MFA_ENROLL', 'MFA login not supported yet (MFA_ENROLL)'],
+   ['LOCKED_OUT', 'Account locked. Unlock it on myAir'],
+   ['PASSWORD_EXPIRED', 'Password expired. Change it on myAir'],
+   ['RECOVERY', 'Login failed: RECOVERY'],
+   [undefined, 'Login failed: unknown']].forEach(function (pair) {
+    var env = h.loadApp({
+      storage: h.CREDENTIALS,
+      routes: [{ match: /authn/, respond: function () {
+        return { status: 200, body: JSON.stringify({ status: pair[0], stateToken: 'st' }) };
+      } }]
+    });
+    env.app.fetchAndSendSleepData();
+    assert.equal(env.timers.length, 0, String(pair[0]));
+    assert.deepEqual(env.errorsSent(), [pair[1]]);
+    assert.ok(pair[1].length <= 60, pair[1]);
+  });
+});
+
+test('a password-expiry warning is skipped and login continues', function () {
+  var routes = h.oktaLoginRoutes();
+  routes[0] = { match: /\/api\/v1\/authn$/, respond: function () {
+    return { status: 200, body: JSON.stringify({
+      status: 'PASSWORD_WARN', stateToken: 'st',
+      _links: { skip: { href: 'https://resmed-ext-1.okta.com/api/v1/authn/skip' } }
+    }) };
+  } };
+  routes.unshift({ match: /\/authn\/skip$/, respond: function (req) {
+    assert.deepEqual(JSON.parse(req.body), { stateToken: 'st' });
+    return { status: 200, body: JSON.stringify({ status: 'SUCCESS', sessionToken: 'sess' }) };
+  } });
+  var env = h.loadApp({
+    storage: h.CREDENTIALS,
+    routes: routes.concat([{ match: /graphql/, respond: function () {
+      return h.graphqlOk([h.sleepRecord('2026-10-24')]);
+    } }])
+  });
+  env.app.fetchAndSendSleepData();
+
+  assert.deepEqual(urlsHit(env), [
+    '/api/v1/authn', '/api/v1/authn/skip', '/oauth2/aus4ccsxvnidQgLmA297/v1/authorize',
+    '/oauth2/aus4ccsxvnidQgLmA297/v1/token', '/graphql'
+  ]);
+  assert.deepEqual(env.errorsSent(), []);
+});
+
+test('a second password-expiry warning is reported instead of looping', function () {
+  var env = h.loadApp({
+    storage: h.CREDENTIALS,
+    routes: [{ match: /authn/, respond: function () {
+      return { status: 200, body: JSON.stringify({
+        status: 'PASSWORD_WARN', stateToken: 'st',
+        _links: { skip: { href: 'https://resmed-ext-1.okta.com/api/v1/authn/skip' } }
+      }) };
+    } }]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.requests.length, 2);
+  assert.deepEqual(env.errorsSent(), ['Login failed: PASSWORD_WARN']);
+});
+
+test('a non-200 authorize response is reported with its status', function () {
+  var routes = h.oktaLoginRoutes();
+  routes[1] = { match: /\/v1\/authorize\?/, respond: function () {
+    return { status: 403, body: '' };
+  } };
+  var env = h.loadApp({ storage: h.CREDENTIALS, routes: routes });
+  env.app.fetchAndSendSleepData();
+  env.runTimers();
+  assert.deepEqual(env.errorsSent(), ['Auth code error (403)']);
+});
+
+test('a fetch stuck past the stale limit no longer blocks new requests', function () {
+  var env = h.loadApp({
+    storage: h.withCachedToken(),
+    routes: [{ match: /./, respond: function () { return { error: 'network' }; } }]
+  });
+  env.app.isDataFetchInProgress = true;
+  env.app.fetchStartedAt = Date.now() - env.app.FETCH_STALE_MS - 1;
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.requests.length, 1);
 });
 
 test('a second REQUEST_DATA while a fetch is in flight is ignored', function () {
@@ -240,6 +326,55 @@ test('logging in with Clay values stores credentials and fetches immediately', f
   assert.equal(env.storage.resmed_email, 'alex@example.com');
   assert.equal(env.storage.resmed_connected, 'true');
   assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+});
+
+test('saving a login shows "Logging in" on the watch before the fetch', function () {
+  var env = h.loadApp({
+    routes: [{ match: /authn/, respond: function () { return { status: 401 }; } }]
+  });
+  closeWith(env, {
+    Email: { value: 'alex@example.com' }, Password: { value: 'hunter2' }, Region: { value: 'EU' }
+  });
+  assert.deepEqual(plain(env.sent[0]), { LOGGING_IN: 1 });
+  assert.match(env.requests[0].url, /^https:\/\/id\.resmed\.eu\/api\/v1\/authn$/);
+  assert.deepEqual(env.errorsSent(), ['Login failed (401)']);
+});
+
+test('saving a login abandons a fetch still running with the old credentials', function () {
+  var authnBodies = [];
+  var env = h.loadApp({
+    storage: h.CREDENTIALS,
+    routes: [{ match: /authn/, respond: function (req) {
+      authnBodies.push(JSON.parse(req.body).password);
+      return { error: 'network' };
+    } }]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.timers.length, 1);
+  closeWith(env, {
+    Email: { value: 'alex@example.com' }, Password: { value: 'new-pass' }, Region: { value: 'NA' }
+  });
+  env.runTimers();
+
+  // The old fetch's pending retry is dropped; only the new login retries
+  assert.deepEqual(authnBodies, ['hunter2', 'new-pass', 'new-pass', 'new-pass']);
+  assert.deepEqual(env.errorsSent(), ['Network error']);
+});
+
+test('settings that are already URL-decoded still log in when the password has a %', function () {
+  var env = h.loadApp({
+    routes: [{ match: /authn/, respond: function () { return { status: 401 }; } }]
+  });
+  env.emit('webviewclosed', { response: JSON.stringify({
+    Email: { value: 'alex@example.com' }, Password: { value: '100%sure' }, Region: { value: 'NA' }
+  }) });
+  assert.equal(env.storage.resmed_password, '100%sure');
+});
+
+test('an unreadable settings response is reported to the watch', function () {
+  var env = h.loadApp();
+  env.emit('webviewclosed', { response: encodeURIComponent('{not json') });
+  assert.deepEqual(env.errorsSent(), ['Could not read settings. Try again']);
 });
 
 test('an invalid email is rejected without being stored', function () {

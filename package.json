@@ -49,7 +49,8 @@
       "SHOW_USAGE",
       "SHOW_MASK_OFF",
       "SHOW_LEAK",
-      "TEXT_INDICATORS"
+      "TEXT_INDICATORS",
+      "LOGGING_IN"
     ],
     "resources": {
       "media": [

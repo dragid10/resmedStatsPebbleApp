@@ -10,8 +10,9 @@
  *   SELECT   — Manually refresh data from myAir
  *   BACK     — Exit app
  *
- * The app also refreshes automatically every 3 hours via the Wakeup API
- * and on every app launch.
+ * Data refreshes on launch when the cache is stale, plus once a day via a
+ * morning Wakeup. A wakeup launch fetches in the background of the UI and
+ * then exits back to the watchface on its own.
  */
 
 #include <pebble.h>
@@ -26,8 +27,17 @@
 /** Wakeup reason identifier (unused, but required by the API). */
 #define WAKEUP_REASON_REFRESH 0
 
-/** Interval between automatic background data refreshes (4 hours). */
-#define WAKEUP_INTERVAL_SECS (4 * 3600)
+/** Local hour of the daily background refresh (after the night's data syncs). */
+#define WAKEUP_HOUR 9
+
+/** Skip the wakeup fetch if data was synced this recently. */
+#define WAKEUP_FRESH_SECS (60 * 60)
+
+/** Give up and exit a wakeup launch if no data arrives in this time. */
+#define WAKEUP_TIMEOUT_MS (60 * 1000)
+
+/** Linger on the result briefly before exiting a wakeup launch. */
+#define WAKEUP_EXIT_DELAY_MS 1500
 
 /**
  * Minimum seconds between manual syncs (SELECT button).
@@ -87,8 +97,12 @@
 /** Outbox buffer size — only sends REQUEST_DATA (very small). */
 #define APPMESSAGE_OUTBOX_SIZE 64
 
-/** Duration to show the "Connected!" screen before switching to data (ms). */
-#define CONNECTED_DISPLAY_MS 1500
+/** Give up waiting for the phone after this long (covers its retries). */
+#define LOADING_TIMEOUT_MS (120 * 1000)
+
+/** Delay and attempt cap for resending REQUEST_DATA the phone NACKed. */
+#define REQUEST_RETRY_DELAY_MS 1000
+#define REQUEST_MAX_ATTEMPTS 10
 
 // -- UI Layout --
 // All positions are computed proportionally from screen bounds in draw
@@ -184,16 +198,21 @@ static int s_current_day_index = 0;      // Currently displayed day (0 = most re
 // -- App State --
 static AppState s_app_state = STATE_LOADING;
 static char s_error_message[ERROR_MSG_MAX_LEN];
+static bool s_error_is_cooldown = false;      // Error screen is the manual-sync cooldown
 static char s_last_sync_time[SYNC_TIME_MAX_LEN];
 
 // -- Loading Animation --
 static int s_loading_dot_count = 0;      // Current number of dots (0-2)
 static AppTimer *s_loading_anim_timer = NULL;
+static AppTimer *s_loading_timeout_timer = NULL;
+static AppTimer *s_request_retry_timer = NULL;
+static int s_request_attempts = 0;
+static bool s_sync_failed = false;       // Last refresh failed; cached data still shown
 
 // -- Settings --
 static bool s_colorblind_mode = false;         // Swap color palette for colorblind users
 static bool s_text_indicators = false;         // Replace values with "Good"/"OK"/"Poor" text
-static int s_sync_interval_hours = 4;          // Hours between automatic syncs
+static int s_sync_interval_hours = 4;          // Hours before cached data is refreshed on open
 
 // Stat visibility flags (all default to visible)
 static bool s_show_events = true;
@@ -202,8 +221,8 @@ static bool s_show_mask_off = true;
 static bool s_show_leak = true;
 
 // -- Sync Timing --
-static WakeupId s_wakeup_id = -1;
 static bool s_launched_by_wakeup = false;
+static AppTimer *s_wakeup_exit_timer = NULL;
 static time_t s_last_sync_epoch = 0;           // Unix timestamp of last successful sync
 
 // ---------------------------------------------------------------------------
@@ -293,15 +312,60 @@ static void persist_load_records(void) {
 // Wakeup — Schedule periodic background data refreshes
 // ---------------------------------------------------------------------------
 
-/** Schedule (or reschedule) the next automatic data refresh. */
+/**
+ * Schedule the next daily refresh at WAKEUP_HOUR local time.
+ *
+ * Cancels every existing wakeup first: older builds scheduled a new wakeup
+ * on each launch without cancelling the previous one, so they piled up.
+ */
 static void schedule_next_wakeup(void) {
-    if (s_wakeup_id >= 0) {
-        wakeup_cancel(s_wakeup_id);
+    wakeup_cancel_all();
+
+    time_t now = time(NULL);
+    struct tm *local_time = localtime(&now);
+    local_time->tm_hour = WAKEUP_HOUR;
+    local_time->tm_min = 0;
+    local_time->tm_sec = 0;
+    time_t next_wakeup_time = mktime(local_time);
+    if (next_wakeup_time <= now + 60) {
+        next_wakeup_time += 24 * 3600;
     }
-    // Use the user's configured sync interval (default 4 hours)
-    int interval_secs = s_sync_interval_hours * 3600;
-    time_t next_wakeup_time = time(NULL) + interval_secs;
-    s_wakeup_id = wakeup_schedule(next_wakeup_time, WAKEUP_REASON_REFRESH, true);
+
+    // Another app may hold a wakeup within a minute of ours; nudge later
+    for (int attempt = 0; attempt < 5; attempt++) {
+        WakeupId id = wakeup_schedule(next_wakeup_time + attempt * 120,
+                                      WAKEUP_REASON_REFRESH, false);
+        if (id != E_RANGE) {
+            if (id < 0) {
+                APP_LOG(APP_LOG_LEVEL_ERROR, "wakeup_schedule failed: %d", (int)id);
+            }
+            return;
+        }
+    }
+}
+
+/** Exit to the watchface, ending a wakeup launch. */
+static void wakeup_exit_callback(void *data) {
+    s_wakeup_exit_timer = NULL;
+    window_stack_pop_all(true);
+}
+
+/** If this is an unattended wakeup launch, exit after `delay_ms`. */
+static void schedule_wakeup_exit(uint32_t delay_ms) {
+    if (!s_launched_by_wakeup) return;
+    if (s_wakeup_exit_timer) {
+        app_timer_cancel(s_wakeup_exit_timer);
+    }
+    s_wakeup_exit_timer = app_timer_register(delay_ms, wakeup_exit_callback, NULL);
+}
+
+/** The user is interacting, so keep the app open after all. */
+static void cancel_wakeup_exit(void) {
+    s_launched_by_wakeup = false;
+    if (s_wakeup_exit_timer) {
+        app_timer_cancel(s_wakeup_exit_timer);
+        s_wakeup_exit_timer = NULL;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +374,7 @@ static void schedule_next_wakeup(void) {
 
 /** Send a REQUEST_DATA message to the phone to trigger a data fetch. */
 static void send_data_request(void) {
+    s_request_attempts++;
     DictionaryIterator *outbox;
     AppMessageResult result = app_message_outbox_begin(&outbox);
     if (result == APP_MSG_OK) {
@@ -386,7 +451,7 @@ static void draw_header(GContext *ctx, GRect bounds, SleepRecord *record) {
 
         // Show day counter on right (e.g. "2/7")
         if (s_total_days > 1) {
-            static char day_counter[8];
+            static char day_counter[24];
             snprintf(day_counter, sizeof(day_counter), "%d/%d",
                      s_current_day_index + 1, s_total_days);
             graphics_draw_text(ctx, day_counter,
@@ -501,7 +566,7 @@ static void draw_stats(GContext *ctx, GRect bounds, SleepRecord *record) {
     graphics_draw_line(ctx, GPoint(6, stats_top - 3), GPoint(W - 6, stats_top - 3));
 
     // Format values — text indicators replace numbers when enabled
-    static char ahi_text[12];
+    static char ahi_text[16];
     static char usage_text[12];
     static char mask_text[8];
     static char leak_text[8];
@@ -552,7 +617,25 @@ static void draw_footer(GContext *ctx, GRect bounds) {
     const char *footer_text;
     static char sync_buf[40];
 
-    if (s_last_sync_time[0] != '\0') {
+    if (s_sync_failed) {
+        footer_text = "Sync failed. SELECT to retry";
+    } else if (s_last_sync_epoch != 0) {
+        // Include the date when the last sync wasn't today, so stale data
+        // doesn't look fresh
+        time_t now = time(NULL);
+        struct tm *now_tm = localtime(&now);
+        int today_yday = now_tm->tm_yday;
+        int today_year = now_tm->tm_year;
+        struct tm *sync_tm = localtime(&s_last_sync_epoch);
+        if (sync_tm->tm_yday == today_yday && sync_tm->tm_year == today_year) {
+            snprintf(sync_buf, sizeof(sync_buf), "Synced %s", s_last_sync_time);
+        } else {
+            char month_buf[8];
+            strftime(month_buf, sizeof(month_buf), "%b", sync_tm);
+            snprintf(sync_buf, sizeof(sync_buf), "Synced %s %d", month_buf, sync_tm->tm_mday);
+        }
+        footer_text = sync_buf;
+    } else if (s_last_sync_time[0] != '\0') {
         snprintf(sync_buf, sizeof(sync_buf), "Synced %s", s_last_sync_time);
         footer_text = sync_buf;
     } else {
@@ -589,7 +672,11 @@ static void draw_error_screen(GContext *ctx, GRect bounds) {
         GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
     graphics_context_set_text_color(ctx, COLOR_HINT);
-    graphics_draw_text(ctx, "SELECT to retry",
+    // During the cooldown a short press only repeats this message, so
+    // point at the long press that bypasses it
+    const char *hint = s_error_is_cooldown ? "Hold SELECT to force sync"
+                                           : "SELECT to retry";
+    graphics_draw_text(ctx, hint,
         fonts_get_system_font(FONT_KEY_GOTHIC_14),
         GRect(0, bounds.size.h / 2 + 30, bounds.size.w, 18),
         GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
@@ -676,9 +763,19 @@ static void loading_animation_tick(void *data) {
     }
 }
 
+/** Forward declaration — defined with the AppMessage callbacks. */
+static void loading_timeout_callback(void *data);
+
 /** Enter the loading state and start the dot animation. */
 static void enter_loading_state(void) {
     s_app_state = STATE_LOADING;
+    s_sync_failed = false;
+    s_request_attempts = 0;
+    if (s_loading_timeout_timer) {
+        app_timer_cancel(s_loading_timeout_timer);
+    }
+    s_loading_timeout_timer = app_timer_register(LOADING_TIMEOUT_MS,
+                                                  loading_timeout_callback, NULL);
     s_loading_dot_count = 0;
     layer_mark_dirty(s_canvas_layer);
     if (s_loading_anim_timer) {
@@ -688,11 +785,19 @@ static void enter_loading_state(void) {
                                                loading_animation_tick, NULL);
 }
 
-/** Stop the loading animation timer. */
+/** Stop the loading animation and the timeout/retry timers. */
 static void stop_loading_animation(void) {
     if (s_loading_anim_timer) {
         app_timer_cancel(s_loading_anim_timer);
         s_loading_anim_timer = NULL;
+    }
+    if (s_loading_timeout_timer) {
+        app_timer_cancel(s_loading_timeout_timer);
+        s_loading_timeout_timer = NULL;
+    }
+    if (s_request_retry_timer) {
+        app_timer_cancel(s_request_retry_timer);
+        s_request_retry_timer = NULL;
     }
 }
 
@@ -702,6 +807,13 @@ static void stop_loading_animation(void) {
 
 /** UP button: navigate to the previous day's record. */
 static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
+    cancel_wakeup_exit();
+    if (s_app_state == STATE_ERROR && s_total_days > 0) {
+        // Dismiss the error and go back to the cached data
+        s_app_state = STATE_DISPLAY;
+        layer_mark_dirty(s_canvas_layer);
+        return;
+    }
     if (s_app_state != STATE_DISPLAY || s_total_days == 0) return;
     s_current_day_index = (s_current_day_index - 1 + s_total_days) % s_total_days;
     layer_mark_dirty(s_canvas_layer);
@@ -709,6 +821,12 @@ static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
 
 /** DOWN button: navigate to the next day's record. */
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
+    cancel_wakeup_exit();
+    if (s_app_state == STATE_ERROR && s_total_days > 0) {
+        s_app_state = STATE_DISPLAY;
+        layer_mark_dirty(s_canvas_layer);
+        return;
+    }
     if (s_app_state != STATE_DISPLAY || s_total_days == 0) return;
     s_current_day_index = (s_current_day_index + 1) % s_total_days;
     layer_mark_dirty(s_canvas_layer);
@@ -720,6 +838,7 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
  * once per night, so frequent refreshes aren't useful.
  */
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
+    cancel_wakeup_exit();
     // If not configured, do nothing — user needs to log in on phone
     if (s_app_state == STATE_NO_CONFIG) {
         return;
@@ -737,6 +856,7 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
             int mins_remaining = (MANUAL_SYNC_COOLDOWN_SECS - seconds_since_sync) / 60 + 1;
             snprintf(s_error_message, sizeof(s_error_message),
                      "Synced recently.\nRetry in %d min.", mins_remaining);
+            s_error_is_cooldown = true;
             s_app_state = STATE_ERROR;
             layer_mark_dirty(s_canvas_layer);
             return;
@@ -749,6 +869,7 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
 
 /** Long-press SELECT (3 seconds): force sync, bypassing cooldown. */
 static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+    cancel_wakeup_exit();
     if (s_app_state == STATE_NO_CONFIG) return;
     if (s_app_state == STATE_LOADING || s_app_state == STATE_CONNECTED) return;
 
@@ -800,14 +921,25 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         } else {
             snprintf(s_error_message, sizeof(s_error_message), "%s",
                      error_tuple->value->cstring);
-            s_app_state = STATE_ERROR;
-            // Brief vibration to alert user since the phone has no error UI
+            s_error_is_cooldown = false;
+            if (s_total_days > 0) {
+                // Keep showing the cached data; the footer notes the failure
+                s_sync_failed = true;
+                s_app_state = STATE_DISPLAY;
+            } else {
+                s_app_state = STATE_ERROR;
+            }
+            // Brief vibration to alert user since the phone has no error UI,
+            // but stay quiet during an unattended wakeup refresh.
             // Custom pattern: 100ms buzz (shorter than vibes_short_pulse's 200ms)
-            static const uint32_t error_vibe[] = { 100 };
-            VibePattern pat = { .durations = error_vibe, .num_segments = 1 };
-            vibes_enqueue_custom_pattern(pat);
+            if (!s_launched_by_wakeup) {
+                static const uint32_t error_vibe[] = { 100 };
+                VibePattern pat = { .durations = error_vibe, .num_segments = 1 };
+                vibes_enqueue_custom_pattern(pat);
+            }
         }
         layer_mark_dirty(s_canvas_layer);
+        schedule_wakeup_exit(WAKEUP_EXIT_DELAY_MS);
         return;
     }
 
@@ -829,7 +961,6 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
             s_sync_interval_hours = (int)sync_int_tuple->value->int32;
             if (s_sync_interval_hours < 4) s_sync_interval_hours = 4;
             persist_write_int(PERSIST_KEY_SYNC_INTERVAL, s_sync_interval_hours);
-            schedule_next_wakeup();
         }
 
         // Stat visibility flags
@@ -862,7 +993,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
     // This message confirms that authentication succeeded and data was found.
     Tuple *total_days_tuple = dict_find(iterator, MESSAGE_KEY_TOTAL_DAYS);
     if (total_days_tuple && !dict_find(iterator, MESSAGE_KEY_DAY_INDEX)) {
-        stop_loading_animation();
+        // Leave the loading timeout running in case the sequence stalls
         s_total_days = (int)total_days_tuple->value->int32;
         s_current_day_index = 0;
         memset(s_records, 0, sizeof(s_records));
@@ -870,9 +1001,12 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         // Clear the sync cooldown so fresh logins sync immediately
         s_last_sync_epoch = 0;
 
-        // Show the "Connected!" confirmation screen
-        s_app_state = STATE_CONNECTED;
-        layer_mark_dirty(s_canvas_layer);
+        // Show the "Connected!" confirmation only on first login; a routine
+        // refresh stays on the loading screen until DATA_COMPLETE
+        if (!persist_exists(PERSIST_KEY_RECORDS)) {
+            s_app_state = STATE_CONNECTED;
+            layer_mark_dirty(s_canvas_layer);
+        }
         return;
     }
 
@@ -914,6 +1048,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
     Tuple *complete_tuple = dict_find(iterator, MESSAGE_KEY_DATA_COMPLETE);
     if (complete_tuple) {
         stop_loading_animation();
+        s_sync_failed = false;
         s_app_state = STATE_DISPLAY;
         s_current_day_index = 0;
 
@@ -930,6 +1065,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         persist_save_records();
         persist_write_int(PERSIST_KEY_SYNC_EPOCH, (int)s_last_sync_epoch);
         layer_mark_dirty(s_canvas_layer);
+        schedule_wakeup_exit(WAKEUP_EXIT_DELAY_MS);
     }
 }
 
@@ -937,9 +1073,47 @@ static void inbox_dropped_handler(AppMessageResult reason, void *context) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "AppMessage dropped: reason=%d", reason);
 }
 
+static void request_retry_callback(void *data) {
+    s_request_retry_timer = NULL;
+    if (s_app_state == STATE_LOADING) {
+        send_data_request();
+    }
+}
+
+/**
+ * The phone NACKs REQUEST_DATA when PebbleKit JS isn't running yet (common
+ * right after launch), so resend it while we're still waiting for data.
+ */
 static void outbox_failed_handler(DictionaryIterator *iterator,
                                    AppMessageResult reason, void *context) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "AppMessage outbox send failed: reason=%d", reason);
+    if (s_app_state == STATE_LOADING && s_request_attempts < REQUEST_MAX_ATTEMPTS &&
+        !s_request_retry_timer) {
+        s_request_retry_timer = app_timer_register(REQUEST_RETRY_DELAY_MS,
+                                                   request_retry_callback, NULL);
+    }
+}
+
+/** No data arrived in time: fall back to cached data or show an error. */
+static void loading_timeout_callback(void *data) {
+    s_loading_timeout_timer = NULL;
+    if (s_app_state != STATE_LOADING && s_app_state != STATE_CONNECTED) return;
+    stop_loading_animation();
+
+    // A half-received sequence may have cleared the in-memory records;
+    // reload the last complete set from flash
+    persist_load_records();
+    if (s_total_days > 0) {
+        s_sync_failed = true;
+        s_app_state = STATE_DISPLAY;
+    } else {
+        snprintf(s_error_message, sizeof(s_error_message),
+                 "No response from phone");
+        s_error_is_cooldown = false;
+        s_app_state = STATE_ERROR;
+    }
+    layer_mark_dirty(s_canvas_layer);
+    schedule_wakeup_exit(0);
 }
 
 static void outbox_sent_handler(DictionaryIterator *iterator, void *context) {
@@ -950,8 +1124,9 @@ static void outbox_sent_handler(DictionaryIterator *iterator, void *context) {
 // Wakeup Handler — Background refresh triggered by scheduled wakeup
 // ---------------------------------------------------------------------------
 
+/** A wakeup fired while the app was already open: the user is here, so just refresh. */
 static void wakeup_handler(WakeupId id, int32_t reason) {
-    s_launched_by_wakeup = true;
+    enter_loading_state();
     send_data_request();
     schedule_next_wakeup();
 }
@@ -1038,10 +1213,27 @@ static void init(void) {
         s_launched_by_wakeup = true;
     }
 
+    time_t now = time(NULL);
+
+    if (s_launched_by_wakeup) {
+        // Daily background refresh: fetch unless synced within the hour,
+        // then exit back to the watchface without user interaction.
+        bool recently_synced = (s_last_sync_epoch != 0) &&
+                               ((now - s_last_sync_epoch) < WAKEUP_FRESH_SECS);
+        if (recently_synced) {
+            schedule_wakeup_exit(0);
+        } else {
+            enter_loading_state();
+            send_data_request();
+            schedule_wakeup_exit(WAKEUP_TIMEOUT_MS);
+        }
+        schedule_next_wakeup();
+        return;
+    }
+
     // Only fetch fresh data if cache is stale or empty.
     // s_last_sync_epoch == 0 means fresh install or post-login (always fetch).
     // Otherwise, only fetch if more than sync_interval has passed.
-    time_t now = time(NULL);
     bool cache_is_stale = (s_last_sync_epoch == 0) ||
                           ((now - s_last_sync_epoch) >= s_sync_interval_hours * 3600);
 

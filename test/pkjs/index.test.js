@@ -535,3 +535,100 @@ test('MFA messages never trigger the watch\'s "not configured" wipe', function (
     assert.equal(env.app.isPermanentFetchError(msg), true, msg);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Token handling after login
+// ---------------------------------------------------------------------------
+
+test('an escaped auth code from Okta is unescaped before the token exchange', function () {
+  var routes = h.oktaLoginRoutes();
+  routes[1] = { match: /\/v1\/authorize\?/, respond: function () {
+    return { status: 200, body: "<script>data.code = 'ab\\x2Dcd\\x5Fef';</script>" };
+  } };
+  var env = h.loadApp({ storage: h.CREDENTIALS, routes: routes.concat([
+    { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
+  ]) });
+  env.app.fetchAndSendSleepData();
+  var tokenReq = env.requests.filter(function (r) { return /\/v1\/token$/.test(r.url); })[0];
+  assert.match(tokenReq.body, /code=ab-cd_ef&/);
+});
+
+test('an account with no CPAP machine reports it and stays connected', function () {
+  var env = h.loadApp({
+    storage: h.withCachedToken(),
+    routes: [{ match: /graphql/, respond: function () {
+      return { status: 200, body: JSON.stringify({ errors: [{
+        errorType: 'myAir:result', extensions: { errorCode: 'equipmentNotAssigned' }
+      }] }) };
+    } }]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.timers.length, 0);
+  assert.deepEqual(env.errorsSent(), ['No CPAP machine linked to this myAir account']);
+  assert.equal(env.storage.resmed_connected, 'true');
+  assert.equal(env.storage.resmed_access_token, 'cached-token');
+});
+
+test('a retry after a transient API error keeps the cached token', function () {
+  var calls = 0;
+  var env = h.loadApp({
+    storage: h.withCachedToken(),
+    routes: [{ match: /graphql/, respond: function () {
+      calls++;
+      return calls === 1 ? { status: 502 } : h.graphqlOk([h.sleepRecord('2026-10-24')]);
+    } }]
+  });
+  env.app.fetchAndSendSleepData();
+  env.runTimers();
+  assert.deepEqual(urlsHit(env), ['/graphql', '/graphql']);
+  assert.equal(env.storage.resmed_connected, 'true');
+});
+
+test('EU logins keep a refresh token and use it instead of a new emailed code', function () {
+  var calls = [];
+  var routes = euMfaRoutes('123456', calls);
+  routes[3] = { match: /\/v1\/token$/, respond: function (req) {
+    if (/grant_type=refresh_token/.test(req.body)) {
+      return { status: 200, body: JSON.stringify({ access_token: 'refreshed', expires_in: 3600 }) };
+    }
+    return { status: 200, body: JSON.stringify({
+      access_token: 'fresh-token', id_token: 'a.b.c', refresh_token: 'rt-1', expires_in: 3600
+    }) };
+  } };
+  var env = h.loadApp({ routes: routes });
+  closeWith(env, EU_LOGIN);
+  closeWith(env, { MfaCode: '123456' });
+  assert.match(env.requests.filter(function (r) { return /authorize/.test(r.url); })[0].url,
+    /scope=openid%20profile%20email%20offline_access/);
+  assert.equal(env.storage.resmed_refresh_token, 'rt-1');
+
+  // Access token expires: the next refresh uses the refresh token, no authn
+  env.storage.resmed_token_expiry = String(Date.now() - 1);
+  var before = env.requests.length;
+  env.emit('appmessage', { payload: { REQUEST_DATA: 1 } });
+  assert.deepEqual(urlsHit({ requests: env.requests.slice(before) }),
+    ['/oauth2/aus2uznux2sYKTsEg417/v1/token', '/graphql']);
+  assert.equal(env.storage.resmed_access_token, 'refreshed');
+});
+
+test('a rejected refresh token falls back to a full login', function () {
+  var env = h.loadApp({
+    storage: Object.assign({}, h.CREDENTIALS, { resmed_region: 'EU', resmed_refresh_token: 'old' }),
+    routes: [
+      { match: /\/v1\/token$/, respond: function () { return { status: 400, body: '{}' }; } },
+      { match: /\/api\/v1\/authn$/, respond: function () { return { status: 401 }; } }
+    ]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.equal(env.storage.resmed_refresh_token, undefined);
+  assert.deepEqual(env.errorsSent(), ['Login failed (401)']);
+});
+
+test('NA logins do not ask for a refresh token', function () {
+  var env = h.loadApp({ storage: h.CREDENTIALS, routes: h.oktaLoginRoutes().concat([
+    { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
+  ]) });
+  env.app.fetchAndSendSleepData();
+  var authorize = env.requests.filter(function (r) { return /authorize/.test(r.url); })[0];
+  assert.doesNotMatch(authorize.url, /offline_access/);
+});

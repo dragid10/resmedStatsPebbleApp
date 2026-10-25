@@ -860,10 +860,10 @@ Pebble.addEventListener('ready', function () {
     return;
   }
 
+  // With credentials, wait for the watch's REQUEST_DATA: it only asks when
+  // its cache is stale, and resends if this JS wasn't running yet
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
-  if (savedEmail) {
-    fetchAndSendSleepData();
-  } else {
+  if (!savedEmail) {
     sendErrorToWatch('Open Settings to log in');
   }
 });

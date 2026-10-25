@@ -1064,6 +1064,8 @@ static void tap_handler(AccelAxisType axis, int32_t direction) {
     if (s_app_state != STATE_DISPLAY) return;
 
     uint64_t now = now_ms();
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "tap gap: %d ms",
+            s_last_tap_ms ? (int)(now - s_last_tap_ms) : -1);
     if (!is_double_tap(now, s_last_tap_ms)) {
         s_last_tap_ms = now;
         return;

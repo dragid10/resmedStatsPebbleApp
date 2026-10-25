@@ -88,8 +88,8 @@ int cooldown_minutes_remaining(time_t now, time_t last_sync, int cooldown_secs);
 time_t next_daily_wakeup(time_t now, time_t today_at_hour);
 
 /** Two taps count as a double tap when the second lands in this window. */
-#define DOUBLE_TAP_MIN_MS 150
-#define DOUBLE_TAP_MAX_MS 700
+#define DOUBLE_TAP_MIN_MS 100
+#define DOUBLE_TAP_MAX_MS 1500
 
 /**
  * True when a tap at `now_ms` completes a double tap begun at `last_tap_ms`

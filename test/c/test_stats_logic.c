@@ -120,11 +120,12 @@ static void test_next_daily_wakeup(void) {
 
 static void test_double_tap(void) {
     CHECK(!is_double_tap(5000, 0));          // first tap ever
-    CHECK(is_double_tap(5300, 5000));        // 300 ms apart
-    CHECK(is_double_tap(5150, 5000));        // edge of the window
-    CHECK(is_double_tap(5700, 5000));
+    CHECK(is_double_tap(5400, 5000));        // brisk double tap
+    CHECK(is_double_tap(6200, 5000));        // Pebble reports taps slowly
+    CHECK(is_double_tap(5100, 5000));        // edges of the window
+    CHECK(is_double_tap(6500, 5000));
     CHECK(!is_double_tap(5050, 5000));       // one shake reporting twice
-    CHECK(!is_double_tap(5701, 5000));       // too slow
+    CHECK(!is_double_tap(6501, 5000));       // too slow
     CHECK(!is_double_tap(4000, 5000));       // clock went backwards
 }
 

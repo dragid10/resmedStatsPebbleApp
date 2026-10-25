@@ -478,16 +478,29 @@ function authenticateWithOkta(email, password, region, callback) {
   }
 
   var oktaBaseUrl = regionConfig.okta_url;
-  var authServerId = regionConfig.auth_server_id;
 
   // -- Step 1: Primary authentication (get session token) --
 
   var credentialsPayload = JSON.stringify({ username: email, password: password });
 
+  postOktaAuthn(oktaBaseUrl + '/api/v1/authn', credentialsPayload, false,
+    function (authnError, sessionToken) {
+      if (authnError) { callback(authnError); return; }
+      exchangeSessionToken(sessionToken, regionConfig, callback);
+    }
+  );
+}
+
+/**
+ * POST to an Okta authn endpoint and resolve the response to a session token.
+ * A password-expiry warning is skipped once (the password still works);
+ * any other non-SUCCESS status becomes an error naming that status.
+ */
+function postOktaAuthn(url, payload, alreadySkipped, callback) {
   makeHttpRequest(
-    oktaBaseUrl + '/api/v1/authn',
+    url,
     'POST',
-    credentialsPayload,
+    payload,
     { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     function (networkError, httpStatus, responseBody) {
       if (networkError) { callback('Network error'); return; }
@@ -498,115 +511,143 @@ function authenticateWithOkta(email, password, region, callback) {
       try { authnResponse = JSON.parse(responseBody); }
       catch (e) { callback('Bad auth response'); return; }
 
-      // Finding #10: Don't instruct users to disable MFA
-      if (authnResponse.status === 'MFA_REQUIRED') {
-        callback('MFA accounts not yet supported. You may disable MFA on your myAir account, but this is not recommended as it reduces your account security.');
-        return;
-      }
-      if (authnResponse.status !== 'SUCCESS') {
-        callback('Login failed');
+      var status = authnResponse.status;
+      if (status === 'SUCCESS' && authnResponse.sessionToken) {
+        callback(null, authnResponse.sessionToken);
         return;
       }
 
-      var sessionToken = authnResponse.sessionToken;
+      var skipLink = authnResponse._links && authnResponse._links.skip;
+      if (status === 'PASSWORD_WARN' && !alreadySkipped && skipLink && skipLink.href &&
+          authnResponse.stateToken) {
+        postOktaAuthn(skipLink.href,
+          JSON.stringify({ stateToken: authnResponse.stateToken }), true, callback);
+        return;
+      }
 
-      // -- Step 2: Exchange session token for authorization code via PKCE --
+      callback(authnStatusMessage(status));
+    }
+  );
+}
 
-      var codeVerifier = generateCodeVerifier();
-      var codeChallenge = generateCodeChallenge(codeVerifier);
+/**
+ * Watch-sized error for an Okta authn status we can't complete.
+ * Names the status so user reports tell us what Okta asked for.
+ * Finding #10: Don't instruct users to disable MFA.
+ */
+function authnStatusMessage(status) {
+  if (status && status.indexOf('MFA_') === 0) {
+    return 'MFA login not supported yet (' + status + ')';
+  }
+  if (status === 'LOCKED_OUT') return 'Account locked. Unlock it on myAir';
+  if (status === 'PASSWORD_EXPIRED') return 'Password expired. Change it on myAir';
+  return 'Login failed: ' + (status || 'unknown');
+}
 
-      // Generate and store state for CSRF validation (Finding #4)
-      var oauthState = generateOAuthState();
+/**
+ * Steps 2 and 3 of the login: exchange an Okta session token for an
+ * authorization code (PKCE), then for access + id tokens.
+ */
+function exchangeSessionToken(sessionToken, regionConfig, callback) {
+  var oktaBaseUrl = regionConfig.okta_url;
+  var authServerId = regionConfig.auth_server_id;
 
-      var authorizeUrl = oktaBaseUrl + '/oauth2/' + authServerId + '/v1/authorize?' +
-        'client_id=' + encodeURIComponent(regionConfig.client_id) +
-        '&response_type=code' +
-        '&scope=' + encodeURIComponent('openid profile email') +
+  // -- Step 2: Exchange session token for authorization code via PKCE --
+
+  var codeVerifier = generateCodeVerifier();
+  var codeChallenge = generateCodeChallenge(codeVerifier);
+
+  // Generate and store state for CSRF validation (Finding #4)
+  var oauthState = generateOAuthState();
+
+  var authorizeUrl = oktaBaseUrl + '/oauth2/' + authServerId + '/v1/authorize?' +
+    'client_id=' + encodeURIComponent(regionConfig.client_id) +
+    '&response_type=code' +
+    '&scope=' + encodeURIComponent('openid profile email') +
+    '&redirect_uri=' + encodeURIComponent(regionConfig.redirect_url) +
+    '&state=' + encodeURIComponent(oauthState) +
+    '&code_challenge_method=S256' +
+    '&code_challenge=' + encodeURIComponent(codeChallenge) +
+    '&sessionToken=' + encodeURIComponent(sessionToken) +
+    '&response_mode=okta_post_message';
+
+  makeHttpRequest(
+    authorizeUrl,
+    'GET',
+    null,
+    { 'Accept': 'text/html' },
+    function (networkError, httpStatus, responseBody) {
+      if (networkError) { callback('Auth code error'); return; }
+      if (httpStatus !== 200) { callback('Auth code error (' + httpStatus + ')'); return; }
+
+      // Parse authorization code from HTML response
+      var authCodeMatch = responseBody.match(/data\.code\s*=\s*'([^']+)'/);
+      if (!authCodeMatch) {
+        authCodeMatch = responseBody.match(/code=([^"&\s]+)/);
+      }
+      if (!authCodeMatch) {
+        authCodeMatch = responseBody.match(/"code"\s*:\s*"([^"]+)"/);
+      }
+      if (!authCodeMatch) {
+        // Finding #6: Don't log the response body
+        callback('Could not get auth code');
+        return;
+      }
+
+      var authorizationCode = authCodeMatch[1];
+
+      // Validate OAuth state to prevent CSRF (Finding #4)
+      var stateMatch = responseBody.match(/data\.state\s*=\s*'([^']+)'/) ||
+                       responseBody.match(/state=([^"&\s]+)/);
+      if (stateMatch && stateMatch[1] !== oauthState) {
+        callback('Auth security check failed');
+        return;
+      }
+
+
+      // -- Step 3: Exchange authorization code for access token --
+
+      var tokenRequestBody =
+        'grant_type=authorization_code' +
+        '&code=' + encodeURIComponent(authorizationCode) +
         '&redirect_uri=' + encodeURIComponent(regionConfig.redirect_url) +
-        '&state=' + encodeURIComponent(oauthState) +
-        '&code_challenge_method=S256' +
-        '&code_challenge=' + encodeURIComponent(codeChallenge) +
-        '&sessionToken=' + encodeURIComponent(sessionToken) +
-        '&response_mode=okta_post_message';
+        '&client_id=' + encodeURIComponent(regionConfig.client_id) +
+        '&code_verifier=' + encodeURIComponent(codeVerifier);
 
       makeHttpRequest(
-        authorizeUrl,
-        'GET',
-        null,
-        { 'Accept': 'text/html' },
+        oktaBaseUrl + '/oauth2/' + authServerId + '/v1/token',
+        'POST',
+        tokenRequestBody,
+        { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
         function (networkError, httpStatus, responseBody) {
-          if (networkError) { callback('Auth code error'); return; }
-
-          // Parse authorization code from HTML response
-          var authCodeMatch = responseBody.match(/data\.code\s*=\s*'([^']+)'/);
-          if (!authCodeMatch) {
-            authCodeMatch = responseBody.match(/code=([^"&\s]+)/);
-          }
-          if (!authCodeMatch) {
-            authCodeMatch = responseBody.match(/"code"\s*:\s*"([^"]+)"/);
-          }
-          if (!authCodeMatch) {
-            // Finding #6: Don't log the response body
-            callback('Could not get auth code');
-            return;
-          }
-
-          var authorizationCode = authCodeMatch[1];
-
-          // Validate OAuth state to prevent CSRF (Finding #4)
-          var stateMatch = responseBody.match(/data\.state\s*=\s*'([^']+)'/) ||
-                           responseBody.match(/state=([^"&\s]+)/);
-          if (stateMatch && stateMatch[1] !== oauthState) {
-            callback('Auth security check failed');
-            return;
-          }
-
-
-          // -- Step 3: Exchange authorization code for access token --
-
-          var tokenRequestBody =
-            'grant_type=authorization_code' +
-            '&code=' + encodeURIComponent(authorizationCode) +
-            '&redirect_uri=' + encodeURIComponent(regionConfig.redirect_url) +
-            '&client_id=' + encodeURIComponent(regionConfig.client_id) +
-            '&code_verifier=' + encodeURIComponent(codeVerifier);
-
-          makeHttpRequest(
-            oktaBaseUrl + '/oauth2/' + authServerId + '/v1/token',
-            'POST',
-            tokenRequestBody,
-            { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-            function (networkError, httpStatus, responseBody) {
-              if (networkError) { callback('Token error'); return; }
-              if (httpStatus !== 200) {
-                // Finding #6: Don't log response body — parse error safely
-                var tokenErrMsg = 'Login failed. Try again.';
-                try {
-                  var errData = JSON.parse(responseBody);
-                  if (errData.error_description) {
-                    // Truncate and sanitize for watch display
-                    tokenErrMsg = errData.error_description.substring(0, 55);
-                  }
-                } catch (ignored) {}
-                clearCachedToken();
-                callback(tokenErrMsg);
-                return;
+          if (networkError) { callback('Token error'); return; }
+          if (httpStatus !== 200) {
+            // Finding #6: Don't log response body — parse error safely
+            var tokenErrMsg = 'Login failed. Try again.';
+            try {
+              var errData = JSON.parse(responseBody);
+              if (errData.error_description) {
+                // Truncate and sanitize for watch display
+                tokenErrMsg = errData.error_description.substring(0, 55);
               }
+            } catch (ignored) {}
+            clearCachedToken();
+            callback(tokenErrMsg);
+            return;
+          }
 
-              var tokenResponse;
-              try { tokenResponse = JSON.parse(responseBody); }
-              catch (e) { callback('Bad token response'); return; }
+          var tokenResponse;
+          try { tokenResponse = JSON.parse(responseBody); }
+          catch (e) { callback('Bad token response'); return; }
 
-              var accessToken = tokenResponse.access_token;
-              var idToken = tokenResponse.id_token || '';
-              var expiresIn = tokenResponse.expires_in || 3600;
+          var accessToken = tokenResponse.access_token;
+          var idToken = tokenResponse.id_token || '';
+          var expiresIn = tokenResponse.expires_in || 3600;
 
-              // Cache the token to avoid re-authenticating on every request
-              cacheToken(accessToken, idToken, expiresIn);
+          // Cache the token to avoid re-authenticating on every request
+          cacheToken(accessToken, idToken, expiresIn);
 
-              callback(null, accessToken, idToken, regionConfig);
-            }
-          );
+          callback(null, accessToken, idToken, regionConfig);
         }
       );
     }
@@ -755,6 +796,21 @@ function sendRecordsToWatch(sleepRecordItems) {
 
 var isDataFetchInProgress = false;
 
+/** When the in-flight fetch started (ms), so a stuck one can't block forever. */
+var fetchStartedAt = 0;
+
+/**
+ * Bumped whenever a fetch is abandoned (new login, stuck fetch). Attempts
+ * from an older generation drop their results instead of reporting them.
+ */
+var fetchGeneration = 0;
+
+/**
+ * Longer than the slowest possible fetch: 3 attempts of 3 timed-out
+ * requests each, plus the retry delays.
+ */
+var FETCH_STALE_MS = 3 * 3 * XHR_TIMEOUT_MS + 10000;
+
 /** Delays before each retry of a failed fetch (milliseconds). */
 var FETCH_RETRY_DELAYS_MS = [2000, 5000];
 
@@ -764,16 +820,27 @@ var FETCH_RETRY_DELAYS_MS = [2000, 5000];
  * rejected) is treated as transient and retried with a fresh login.
  */
 function isPermanentFetchError(message) {
-  return message === 'Login failed' ||
-    message === 'Login failed (401)' ||
+  return message === 'Login failed (401)' ||
+    message.indexOf('Login failed: ') === 0 ||
     message === 'Invalid region' ||
     message === 'No CPAP data found' ||
     message.indexOf('MFA') === 0 ||
+    message.indexOf('Account locked') === 0 ||
+    message.indexOf('Password expired') === 0 ||
     message.indexOf('Rate limited') === 0;
 }
 
-function fetchAndSendSleepData() {
-  if (isDataFetchInProgress) return;
+/**
+ * Start a login + fetch. `restart` abandons any fetch already in flight,
+ * which a newly saved login needs: the old fetch is using old credentials.
+ */
+function fetchAndSendSleepData(restart) {
+  if (isDataFetchInProgress && !restart &&
+      Date.now() - fetchStartedAt < FETCH_STALE_MS) {
+    return;
+  }
+  fetchGeneration++;
+  isDataFetchInProgress = false;
 
   var email = localStorage.getItem(STORAGE_KEY_EMAIL);
   var password = localStorage.getItem(STORAGE_KEY_PASSWORD);
@@ -785,18 +852,25 @@ function fetchAndSendSleepData() {
   }
 
   isDataFetchInProgress = true;
-  attemptFetch(email, password, region, 0);
+  fetchStartedAt = Date.now();
+  attemptFetch(email, password, region, 0, fetchGeneration);
 }
 
 /** One attempt at login + fetch; retries transient failures with backoff. */
-function attemptFetch(email, password, region, attempt) {
+function attemptFetch(email, password, region, attempt, generation) {
+  function isAbandoned() {
+    return generation !== fetchGeneration;
+  }
+  if (isAbandoned()) return;
+
   function fail(message) {
+    if (isAbandoned()) return;
     if (attempt < FETCH_RETRY_DELAYS_MS.length && !isPermanentFetchError(message)) {
       // Drop the cached token so the retry does a fresh login, in case
       // the server stopped accepting it before its stated expiry
       clearCachedToken();
       setTimeout(function () {
-        attemptFetch(email, password, region, attempt + 1);
+        attemptFetch(email, password, region, attempt + 1, generation);
       }, FETCH_RETRY_DELAYS_MS[attempt]);
       return;
     }
@@ -807,10 +881,12 @@ function attemptFetch(email, password, region, attempt) {
   authenticateWithOkta(email, password, region,
     function (authError, accessToken, idToken, regionConfig) {
       if (authError) { fail(authError); return; }
+      if (isAbandoned()) return;
 
       fetchSleepRecords(accessToken, idToken, regionConfig,
         function (fetchError, sleepRecordItems) {
           if (fetchError) { fail(fetchError); return; }
+          if (isAbandoned()) return;
           isDataFetchInProgress = false;
           localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
           sendRecordsToWatch(sleepRecordItems);
@@ -1032,7 +1108,14 @@ Pebble.addEventListener('webviewclosed', function (event) {
   if (!event || !event.response || event.response === '') return;
 
   try {
-    var decodedCheck = decodeURIComponent(event.response);
+    var decodedCheck;
+    try {
+      decodedCheck = decodeURIComponent(event.response);
+    } catch (decodeError) {
+      // Some phone apps hand back the response already decoded, and a
+      // literal % (e.g. in a password) then fails to decode again
+      decodedCheck = event.response;
+    }
     if (!decodedCheck || decodedCheck.charAt(0) !== '{') return;
 
     var parsed = JSON.parse(decodedCheck);
@@ -1111,7 +1194,16 @@ Pebble.addEventListener('webviewclosed', function (event) {
     clearCachedToken();
     localStorage.removeItem(STORAGE_KEY_CONNECTED);
 
-    fetchAndSendSleepData();
+    if (localStorage.getItem(STORAGE_KEY_EMAIL) &&
+        localStorage.getItem(STORAGE_KEY_PASSWORD)) {
+      // Swap the watch's setup prompt for a "Logging in" screen right away
+      Pebble.sendAppMessage({ 'LOGGING_IN': 1 }, function () {}, function () {});
+    }
+
+    // Restart: a fetch already in flight is still using the old credentials
+    fetchAndSendSleepData(true);
   } catch (parseError) {
+    // Never fail silently, or the watch sits on its last screen forever
+    sendErrorToWatch('Could not read settings. Try again');
   }
 });

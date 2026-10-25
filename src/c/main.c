@@ -184,6 +184,7 @@ static AppTimer *s_loading_timeout_timer = NULL;
 static AppTimer *s_request_retry_timer = NULL;
 static int s_request_attempts = 0;
 static bool s_sync_failed = false;       // Last refresh failed; cached data still shown
+static bool s_logging_in = false;        // Phone is logging in with newly saved credentials
 
 // -- Settings --
 static bool s_colorblind_mode = false;         // Swap color palette for colorblind users
@@ -565,7 +566,8 @@ static void draw_footer(GContext *ctx, GRect bounds) {
 /** Draw the loading screen with animated dots. */
 static void draw_loading_screen(GContext *ctx, GRect bounds) {
     static char loading_text[20];
-    snprintf(loading_text, sizeof(loading_text), "Loading%.*s",
+    snprintf(loading_text, sizeof(loading_text), "%s%.*s",
+             s_logging_in ? "Logging in" : "Loading",
              s_loading_dot_count + 1, "...");
 
     graphics_context_set_text_color(ctx, COLOR_LOADING);
@@ -683,6 +685,7 @@ static void loading_timeout_callback(void *data);
 static void enter_loading_state(void) {
     s_app_state = STATE_LOADING;
     s_sync_failed = false;
+    s_logging_in = false;
     s_request_attempts = 0;
     if (s_loading_timeout_timer) {
         app_timer_cancel(s_loading_timeout_timer);
@@ -700,6 +703,7 @@ static void enter_loading_state(void) {
 
 /** Stop the loading animation and the timeout/retry timers. */
 static void stop_loading_animation(void) {
+    s_logging_in = false;
     if (s_loading_anim_timer) {
         app_timer_cancel(s_loading_anim_timer);
         s_loading_anim_timer = NULL;
@@ -851,6 +855,15 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
         }
         layer_mark_dirty(s_canvas_layer);
         schedule_wakeup_exit(WAKEUP_EXIT_DELAY_MS);
+        return;
+    }
+
+    // -- Phone started logging in with newly saved credentials --
+    // Without this the setup prompt stays up for the whole login
+    if (dict_find(iterator, MESSAGE_KEY_LOGGING_IN)) {
+        cancel_wakeup_exit();
+        enter_loading_state();
+        s_logging_in = true;
         return;
     }
 

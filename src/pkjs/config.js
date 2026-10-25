@@ -61,6 +61,10 @@ module.exports = [
     ]
   },
   {
+    "type": "text",
+    "defaultValue": "After you tap Save & Connect, this page closes and your watch shows the login progress. That's expected. If ResMed emails you a verification code (common for Europe accounts), reopen this settings page to enter it."
+  },
+  {
     "type": "submit",
     "defaultValue": "Save & Connect"
   }

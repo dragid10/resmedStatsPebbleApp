@@ -84,7 +84,7 @@ pebble install --phone <PHONE_IP>
 
 - A ResMed myAir account (North America or Europe)
 - A Pebble watch paired with a phone running the Pebble companion app
-- MFA must be disabled on the myAir account (not yet supported)
+- Email verification codes (used by EU myAir accounts) are supported: after saving your login, check your email and enter the code in the app's settings page. Other MFA methods are not supported yet
 
 ## API Details
 

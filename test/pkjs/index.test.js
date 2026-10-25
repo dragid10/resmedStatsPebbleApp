@@ -383,3 +383,155 @@ test('an invalid email is rejected without being stored', function () {
   assert.equal(env.storage.resmed_email, undefined);
   assert.deepEqual(env.errorsSent(), ['Invalid email format']);
 });
+
+// ---------------------------------------------------------------------------
+// Email-code (MFA) login
+// ---------------------------------------------------------------------------
+
+var EU_OKTA = 'https://id.resmed.eu';
+var VERIFY_URL = EU_OKTA + '/api/v1/authn/factors/emf123/verify';
+
+function mfaRequired(factorOverrides) {
+  return { status: 200, body: JSON.stringify({
+    status: 'MFA_REQUIRED', stateToken: 'st-1',
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    _embedded: { factors: [Object.assign({
+      id: 'emf123', factorType: 'email', _links: { verify: { href: VERIFY_URL } }
+    }, factorOverrides || {})] }
+  }) };
+}
+
+/** EU routes: authn asks for a code; verify sends it, then accepts `goodCode`. */
+function euMfaRoutes(goodCode, calls) {
+  var login = h.oktaLoginRoutes();
+  return [
+    { match: /\/authn\/factors\/emf123\/verify/, respond: function (req) {
+      var body = JSON.parse(req.body);
+      calls.push({ url: req.url, body: body });
+      if (body.passCode === undefined) {
+        return { status: 200, body: JSON.stringify({ status: 'MFA_CHALLENGE', stateToken: 'st-1' }) };
+      }
+      if (body.passCode !== goodCode) return { status: 403, body: '{}' };
+      return { status: 200, body: JSON.stringify({ status: 'SUCCESS', sessionToken: 'sess' }) };
+    } },
+    { match: /\/api\/v1\/authn$/, respond: function () { return mfaRequired(); } },
+    login[1], login[2],
+    { match: /graphql/, respond: function () { return h.graphqlOk([h.sleepRecord('2026-10-24')]); } }
+  ];
+}
+
+var EU_LOGIN = {
+  Email: { value: 'alex@example.com' }, Password: { value: 'hunter2' }, Region: { value: 'EU' }
+};
+
+test('an EU login that needs an email code sends the code and asks for it', function () {
+  var calls = [];
+  var env = h.loadApp({ routes: euMfaRoutes('123456', calls) });
+  closeWith(env, EU_LOGIN);
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(plain(calls[0].body), { stateToken: 'st-1' });
+  assert.match(calls[0].url, /\?rememberDevice=true$/);
+  assert.equal(env.timers.length, 0);
+  assert.deepEqual(env.errorsSent(), ['Code emailed. Enter it in the phone app']);
+
+  env.emit('showConfiguration');
+  var page = decodeURIComponent(env.app.Pebble.openedUrl.replace(/^data:text\/html,/, ''));
+  assert.match(page, /Check your email/);
+  assert.match(page, /id="code"/);
+});
+
+test('entering the emailed code finishes the login and loads data', function () {
+  var calls = [];
+  var env = h.loadApp({ routes: euMfaRoutes('123456', calls) });
+  closeWith(env, EU_LOGIN);
+  closeWith(env, { MfaCode: ' 123 456 ' });
+
+  assert.deepEqual(plain(calls[1].body), { stateToken: 'st-1', passCode: '123456' });
+  assert.equal(env.storage.resmed_mfa_pending, undefined);
+  assert.equal(env.storage.resmed_access_token, 'fresh-token');
+  assert.equal(env.storage.resmed_connected, 'true');
+  assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+});
+
+test('a wrong code keeps the challenge open so the user can try again', function () {
+  var calls = [];
+  var env = h.loadApp({ routes: euMfaRoutes('123456', calls) });
+  closeWith(env, EU_LOGIN);
+  closeWith(env, { MfaCode: '999999' });
+
+  assert.deepEqual(env.errorsSent().slice(-1), ['Wrong code. Try again in the phone app']);
+  assert.notEqual(env.storage.resmed_mfa_pending, undefined);
+
+  closeWith(env, { MfaCode: '123456' });
+  assert.equal(env.storage.resmed_connected, 'true');
+});
+
+test('a background refresh that hits the code check does not email a code', function () {
+  var calls = [];
+  var env = h.loadApp({
+    storage: Object.assign({}, h.CREDENTIALS, { resmed_region: 'EU' }),
+    routes: euMfaRoutes('123456', calls)
+  });
+  env.emit('appmessage', { payload: { REQUEST_DATA: 1 } });
+
+  assert.equal(calls.length, 0);
+  assert.deepEqual(env.errorsSent(), ['Code needed. Open the phone app']);
+
+  env.emit('showConfiguration');
+  var page = decodeURIComponent(env.app.Pebble.openedUrl.replace(/^data:text\/html,/, ''));
+  assert.match(page, /Email me a code/);
+});
+
+test('a background refresh while a code is pending keeps that code valid', function () {
+  var calls = [];
+  var env = h.loadApp({ routes: euMfaRoutes('123456', calls) });
+  closeWith(env, EU_LOGIN);
+  var authnCount = env.requests.filter(function (r) { return /\/authn$/.test(r.url); }).length;
+
+  env.emit('appmessage', { payload: { REQUEST_DATA: 1 } });
+  assert.equal(env.requests.filter(function (r) { return /\/authn$/.test(r.url); }).length,
+    authnCount);
+  assert.deepEqual(env.errorsSent().slice(-1), ['Code emailed. Enter it in the phone app']);
+});
+
+test('a verify link off the region\'s Okta host is not followed', function () {
+  var env = h.loadApp({
+    routes: [{ match: /authn$/, respond: function () {
+      return mfaRequired({ _links: { verify: { href: 'https://evil.example/verify' } } });
+    } }]
+  });
+  closeWith(env, EU_LOGIN);
+  assert.equal(env.requests.length, 1);
+  assert.deepEqual(env.errorsSent(), ['MFA login not supported yet (MFA_REQUIRED)']);
+});
+
+test('an expired code challenge asks the user to start over', function () {
+  var env = h.loadApp({ storage: Object.assign({}, h.CREDENTIALS, {
+    resmed_region: 'EU',
+    resmed_mfa_pending: JSON.stringify({
+      stateToken: 'st-1', verifyUrl: VERIFY_URL, expiresAt: Date.now() - 1, codeSent: true
+    })
+  }) });
+  closeWith(env, { MfaCode: '123456' });
+  assert.equal(env.requests.length, 0);
+  assert.deepEqual(env.errorsSent().slice(-1), ['Code expired. Open the phone app']);
+});
+
+test('disconnecting clears a pending code challenge', function () {
+  var calls = [];
+  var env = h.loadApp({ routes: euMfaRoutes('123456', calls) });
+  closeWith(env, EU_LOGIN);
+  closeWith(env, { Logout: true });
+  assert.equal(env.storage.resmed_mfa_pending, undefined);
+});
+
+test('MFA messages never trigger the watch\'s "not configured" wipe', function () {
+  var env = h.loadApp();
+  ['MSG_CODE_SENT', 'MSG_CODE_NEEDED', 'MSG_CODE_WRONG', 'MSG_CODE_EXPIRED'].forEach(function (k) {
+    var msg = env.app[k];
+    assert.ok(msg.indexOf('Settings') === -1 && msg.indexOf('log in') === -1, msg);
+    assert.ok(msg.length <= 60, msg);
+    assert.equal(env.app.isPermanentFetchError(msg), true, msg);
+  });
+});

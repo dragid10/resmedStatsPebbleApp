@@ -61,6 +61,17 @@ var STORAGE_KEY_TOKEN_EXPIRY = 'resmed_token_expiry';
 var STORAGE_KEY_ID_TOKEN = 'resmed_id_token';
 var STORAGE_KEY_DEVICE_ID = 'resmed_device_id';
 var STORAGE_KEY_CONNECTED = 'resmed_connected';  // 'true' only after a successful data fetch
+var STORAGE_KEY_MFA = 'resmed_mfa_pending';       // JSON: email-code login waiting for a code
+
+/** Errors for an email-code (MFA) login. None may contain "Settings" or
+ *  "log in": the watch treats those as "not configured" and wipes its cache. */
+var MSG_CODE_SENT = 'Code emailed. Enter it in the phone app';
+var MSG_CODE_NEEDED = 'Code needed. Open the phone app';
+var MSG_CODE_WRONG = 'Wrong code. Try again in the phone app';
+var MSG_CODE_EXPIRED = 'Code expired. Open the phone app';
+
+/** Fallback lifetime of an Okta MFA transaction if it doesn't say. */
+var MFA_DEFAULT_LIFETIME_MS = 5 * 60 * 1000;
 
 /** Default region if none is configured. */
 var DEFAULT_REGION = 'NA';
@@ -463,7 +474,7 @@ function clearCachedToken() {
  *   2. GET /authorize with PKCE + sessionToken → authorization code
  *   3. POST /token with code + code_verifier → access_token + id_token
  */
-function authenticateWithOkta(email, password, region, callback) {
+function authenticateWithOkta(email, password, region, interactive, callback) {
   var regionConfig = REGION_CONFIG[region];
   if (!regionConfig) {
     callback('Invalid region');
@@ -477,13 +488,12 @@ function authenticateWithOkta(email, password, region, callback) {
     return;
   }
 
-  var oktaBaseUrl = regionConfig.okta_url;
-
   // -- Step 1: Primary authentication (get session token) --
 
   var credentialsPayload = JSON.stringify({ username: email, password: password });
 
-  postOktaAuthn(oktaBaseUrl + '/api/v1/authn', credentialsPayload, false,
+  postOktaAuthn(regionConfig, regionConfig.okta_url + '/api/v1/authn', credentialsPayload,
+    { interactive: interactive },
     function (authnError, sessionToken) {
       if (authnError) { callback(authnError); return; }
       exchangeSessionToken(sessionToken, regionConfig, callback);
@@ -493,10 +503,12 @@ function authenticateWithOkta(email, password, region, callback) {
 
 /**
  * POST to an Okta authn endpoint and resolve the response to a session token.
- * A password-expiry warning is skipped once (the password still works);
- * any other non-SUCCESS status becomes an error naming that status.
+ * A password-expiry warning is skipped once (the password still works).
+ * An email-code challenge is saved for the settings page; the code is only
+ * emailed for an `interactive` login, so background refreshes never spam
+ * the inbox. Any other non-SUCCESS status becomes an error naming it.
  */
-function postOktaAuthn(url, payload, alreadySkipped, callback) {
+function postOktaAuthn(regionConfig, url, payload, options, callback) {
   makeHttpRequest(
     url,
     'POST',
@@ -518,14 +530,143 @@ function postOktaAuthn(url, payload, alreadySkipped, callback) {
       }
 
       var skipLink = authnResponse._links && authnResponse._links.skip;
-      if (status === 'PASSWORD_WARN' && !alreadySkipped && skipLink && skipLink.href &&
-          authnResponse.stateToken) {
-        postOktaAuthn(skipLink.href,
-          JSON.stringify({ stateToken: authnResponse.stateToken }), true, callback);
+      if (status === 'PASSWORD_WARN' && !options.skipped && skipLink &&
+          isOktaUrl(regionConfig, skipLink.href) && authnResponse.stateToken) {
+        postOktaAuthn(regionConfig, skipLink.href,
+          JSON.stringify({ stateToken: authnResponse.stateToken }),
+          { interactive: options.interactive, skipped: true }, callback);
+        return;
+      }
+
+      var emailFactor = status === 'MFA_REQUIRED' && findEmailFactor(regionConfig, authnResponse);
+      if (emailFactor) {
+        savePendingMfa({
+          stateToken: authnResponse.stateToken,
+          verifyUrl: emailFactor._links.verify.href,
+          expiresAt: Date.parse(authnResponse.expiresAt) || Date.now() + MFA_DEFAULT_LIFETIME_MS,
+          codeSent: false
+        });
+        if (options.interactive) {
+          sendMfaCode(callback);
+        } else {
+          callback(MSG_CODE_NEEDED);
+        }
         return;
       }
 
       callback(authnStatusMessage(status));
+    }
+  );
+}
+
+/** True if `url` is on this region's Okta host (we only follow Okta's own links). */
+function isOktaUrl(regionConfig, url) {
+  return typeof url === 'string' && url.indexOf(regionConfig.okta_url + '/') === 0;
+}
+
+/** The email factor from an MFA_REQUIRED response, if it has a usable one. */
+function findEmailFactor(regionConfig, authnResponse) {
+  var factors = authnResponse._embedded && authnResponse._embedded.factors;
+  if (!factors || !authnResponse.stateToken) return null;
+  for (var i = 0; i < factors.length; i++) {
+    var factor = factors[i];
+    if (factor.factorType === 'email' && factor._links && factor._links.verify &&
+        isOktaUrl(regionConfig, factor._links.verify.href)) {
+      return factor;
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Email-code (MFA) login
+// ---------------------------------------------------------------------------
+// EU myAir accounts get an Okta email challenge after the password. The
+// challenge (stateToken + verify URL) is kept in localStorage while the user
+// switches to their inbox, then the settings page asks for the code.
+
+/** The pending email-code login, or null if there is none or it expired. */
+function getPendingMfa() {
+  try {
+    var pending = JSON.parse(localStorage.getItem(STORAGE_KEY_MFA));
+    if (pending && pending.stateToken && pending.verifyUrl && Date.now() < pending.expiresAt) {
+      return pending;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function savePendingMfa(pending) {
+  localStorage.setItem(STORAGE_KEY_MFA, JSON.stringify(pending));
+}
+
+function clearPendingMfa() {
+  localStorage.removeItem(STORAGE_KEY_MFA);
+}
+
+/** Verify URL with rememberDevice, so Okta can skip the code next time. */
+function mfaVerifyUrl(pending) {
+  return pending.verifyUrl + (pending.verifyUrl.indexOf('?') === -1 ? '?' : '&') +
+    'rememberDevice=true';
+}
+
+/** Ask Okta to email a code for the pending challenge. Always ends in an error message. */
+function sendMfaCode(callback) {
+  var pending = getPendingMfa();
+  if (!pending) { callback(MSG_CODE_EXPIRED); return; }
+
+  makeHttpRequest(
+    mfaVerifyUrl(pending),
+    'POST',
+    JSON.stringify({ stateToken: pending.stateToken }),
+    { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    function (networkError, httpStatus) {
+      if (networkError) { callback('Network error'); return; }
+      if (httpStatus === 429) { callback('Rate limited. Try later.'); return; }
+      if (httpStatus !== 200) {
+        clearPendingMfa();
+        callback(MSG_CODE_EXPIRED);
+        return;
+      }
+      pending.codeSent = true;
+      savePendingMfa(pending);
+      callback(MSG_CODE_SENT);
+    }
+  );
+}
+
+/**
+ * Submit the emailed code. On success the resulting tokens are cached, so
+ * the normal fetch that follows goes straight to the API.
+ */
+function verifyMfaCode(code, callback) {
+  var pending = getPendingMfa();
+  var regionConfig = REGION_CONFIG[localStorage.getItem(STORAGE_KEY_REGION) || DEFAULT_REGION];
+  if (!pending || !regionConfig) { clearPendingMfa(); callback(MSG_CODE_EXPIRED); return; }
+
+  makeHttpRequest(
+    mfaVerifyUrl(pending),
+    'POST',
+    JSON.stringify({ stateToken: pending.stateToken, passCode: code }),
+    { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    function (networkError, httpStatus, responseBody) {
+      if (networkError) { callback('Network error'); return; }
+      if (httpStatus === 429) { callback('Rate limited. Try later.'); return; }
+      // Okta answers a wrong code with 403 and keeps the challenge open
+      if (httpStatus === 403) { callback(MSG_CODE_WRONG); return; }
+
+      var result = null;
+      try { result = JSON.parse(responseBody); } catch (e) {}
+      if (httpStatus !== 200 || !result || result.status !== 'SUCCESS' || !result.sessionToken) {
+        clearPendingMfa();
+        callback(MSG_CODE_EXPIRED);
+        return;
+      }
+
+      clearPendingMfa();
+      exchangeSessionToken(result.sessionToken, regionConfig, function (tokenError) {
+        callback(tokenError || null);
+      });
     }
   );
 }
@@ -827,12 +968,16 @@ function isPermanentFetchError(message) {
     message.indexOf('MFA') === 0 ||
     message.indexOf('Account locked') === 0 ||
     message.indexOf('Password expired') === 0 ||
+    message.indexOf('Code ') === 0 ||
+    message === MSG_CODE_WRONG ||
     message.indexOf('Rate limited') === 0;
 }
 
 /**
  * Start a login + fetch. `restart` abandons any fetch already in flight,
  * which a newly saved login needs: the old fetch is using old credentials.
+ * A restart is also the user acting in the settings page, so it may email
+ * a login code; background refreshes only say a code is needed.
  */
 function fetchAndSendSleepData(restart) {
   if (isDataFetchInProgress && !restart &&
@@ -851,13 +996,21 @@ function fetchAndSendSleepData(restart) {
     return;
   }
 
+  // A background refresh must not start a new login while the user is
+  // fetching an emailed code: that would invalidate the code
+  var pendingMfa = getPendingMfa();
+  if (!restart && pendingMfa && !getCachedToken()) {
+    sendErrorToWatch(pendingMfa.codeSent ? MSG_CODE_SENT : MSG_CODE_NEEDED);
+    return;
+  }
+
   isDataFetchInProgress = true;
   fetchStartedAt = Date.now();
-  attemptFetch(email, password, region, 0, fetchGeneration);
+  attemptFetch(email, password, region, 0, fetchGeneration, !!restart);
 }
 
 /** One attempt at login + fetch; retries transient failures with backoff. */
-function attemptFetch(email, password, region, attempt, generation) {
+function attemptFetch(email, password, region, attempt, generation, interactive) {
   function isAbandoned() {
     return generation !== fetchGeneration;
   }
@@ -870,7 +1023,7 @@ function attemptFetch(email, password, region, attempt, generation) {
       // the server stopped accepting it before its stated expiry
       clearCachedToken();
       setTimeout(function () {
-        attemptFetch(email, password, region, attempt + 1, generation);
+        attemptFetch(email, password, region, attempt + 1, generation, interactive);
       }, FETCH_RETRY_DELAYS_MS[attempt]);
       return;
     }
@@ -878,7 +1031,7 @@ function attemptFetch(email, password, region, attempt, generation) {
     sendErrorToWatch(message);
   }
 
-  authenticateWithOkta(email, password, region,
+  authenticateWithOkta(email, password, region, interactive,
     function (authError, accessToken, idToken, regionConfig) {
       if (authError) { fail(authError); return; }
       if (isAbandoned()) return;
@@ -968,6 +1121,7 @@ Pebble.addEventListener('appmessage', function (event) {
       localStorage.removeItem(STORAGE_KEY_REGION);
       localStorage.removeItem(STORAGE_KEY_CONNECTED);
       clearCachedToken();
+      clearPendingMfa();
     }
   }
 
@@ -977,13 +1131,51 @@ Pebble.addEventListener('appmessage', function (event) {
 });
 
 /**
+ * Page asking for the emailed login code. If no code was sent yet (a
+ * background refresh found the challenge), it offers to send one first.
+ */
+function buildMfaCodePage(codeSent) {
+  return '<!DOCTYPE html><html><head>' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<style>' +
+    'body{font-family:-apple-system,sans-serif;background:#1a1a1a;color:#fff;margin:0;padding:20px;box-sizing:border-box;}' +
+    '.card{background:#2a2a2a;border-radius:12px;padding:20px;margin:16px 0;}' +
+    'h2{margin:0 0 6px;font-size:20px;}' +
+    '.info{color:#bbb;font-size:14px;line-height:1.5;margin:8px 0 16px;}' +
+    'input{width:100%;box-sizing:border-box;background:#3a3a3a;color:#fff;border:1px solid #555;border-radius:6px;padding:12px;font-size:22px;letter-spacing:4px;text-align:center;}' +
+    '.btn{display:block;width:100%;padding:14px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;margin:8px 0;box-sizing:border-box;}' +
+    '.btn-save{background:#4A90D9;color:#fff;}' +
+    '.btn-plain{background:#3a3a3a;color:#fff;}' +
+    '.btn-danger{background:#d9534f;color:#fff;}' +
+    '</style></head><body>' +
+    '<div class="card"><h2>Check your email</h2>' +
+    (codeSent
+      ? '<div class="info">ResMed emailed you a verification code. Enter it below.</div>' +
+        '<input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="Code">' +
+        '<button class="btn btn-save" onclick="verify()">Verify</button>' +
+        '<button class="btn btn-plain" onclick="send({MfaResend:true})">Send a new code</button>'
+      : '<div class="info">ResMed needs a verification code to sign you in again.</div>' +
+        '<button class="btn btn-save" onclick="send({MfaResend:true})">Email me a code</button>') +
+    '</div>' +
+    '<button class="btn btn-danger" onclick="send({Logout:true})">Use a different account</button>' +
+    '<script>' +
+    'function send(o){document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify(o));}' +
+    'function verify(){var c=document.getElementById("code").value.replace(/\\s+/g,"");' +
+    'if(c){send({MfaCode:c});}}' +
+    '</script></body></html>';
+}
+
+/**
  * Settings page — shows different content based on login state.
  */
 Pebble.addEventListener('showConfiguration', function () {
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
   var isConnected = localStorage.getItem(STORAGE_KEY_CONNECTED) === 'true';
+  var pendingMfa = getPendingMfa();
 
-  if (savedEmail && isConnected) {
+  if (savedEmail && pendingMfa) {
+    Pebble.openURL('data:text/html,' + encodeURIComponent(buildMfaCodePage(pendingMfa.codeSent)));
+  } else if (savedEmail && isConnected) {
     // Successfully connected — show status page with settings
     var maskedEmail = escapeHtml(savedEmail.charAt(0) + '***@' + savedEmail.split('@')[1]);
 
@@ -1129,7 +1321,31 @@ Pebble.addEventListener('webviewclosed', function (event) {
       localStorage.removeItem(STORAGE_KEY_REGION);
       localStorage.removeItem(STORAGE_KEY_CONNECTED);
       clearCachedToken();
+      clearPendingMfa();
       sendErrorToWatch('Open Settings to log in');
+      return;
+    }
+
+    // -- Handle email-code login (MFA) --
+    if (parsed.MfaResend === true) {
+      Pebble.sendAppMessage({ 'LOGGING_IN': 1 }, function () {}, function () {});
+      fetchAndSendSleepData(true);
+      return;
+    }
+    if (parsed.MfaCode !== undefined) {
+      var code = String(parsed.MfaCode).replace(/\s+/g, '');
+      if (!/^[0-9]{4,10}$/.test(code)) {
+        sendErrorToWatch(MSG_CODE_WRONG);
+        return;
+      }
+      Pebble.sendAppMessage({ 'LOGGING_IN': 1 }, function () {}, function () {});
+      // Abandon any fetch in flight; it can only end in "code needed"
+      fetchGeneration++;
+      isDataFetchInProgress = false;
+      verifyMfaCode(code, function (verifyError) {
+        if (verifyError) { sendErrorToWatch(verifyError); return; }
+        fetchAndSendSleepData(true);
+      });
       return;
     }
 

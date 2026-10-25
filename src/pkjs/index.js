@@ -40,7 +40,7 @@ var MAX_DAYS = 7;
 var MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /** XHR request timeout in milliseconds. */
-var XHR_TIMEOUT_MS = 30000;
+var XHR_TIMEOUT_MS = 15000;
 
 /** Delay before retrying a failed AppMessage send (milliseconds). */
 var APPMESSAGE_RETRY_DELAY_MS = 200;
@@ -755,6 +755,23 @@ function sendRecordsToWatch(sleepRecordItems) {
 
 var isDataFetchInProgress = false;
 
+/** Delays before each retry of a failed fetch (milliseconds). */
+var FETCH_RETRY_DELAYS_MS = [2000, 5000];
+
+/**
+ * Errors that retrying won't fix (bad credentials, account setup, no data).
+ * Everything else (network blips, timeouts, 5xx, a token the server
+ * rejected) is treated as transient and retried with a fresh login.
+ */
+function isPermanentFetchError(message) {
+  return message === 'Login failed' ||
+    message === 'Login failed (401)' ||
+    message === 'Invalid region' ||
+    message === 'No CPAP data found' ||
+    message.indexOf('MFA') === 0 ||
+    message.indexOf('Rate limited') === 0;
+}
+
 function fetchAndSendSleepData() {
   if (isDataFetchInProgress) return;
 
@@ -768,31 +785,32 @@ function fetchAndSendSleepData() {
   }
 
   isDataFetchInProgress = true;
+  attemptFetch(email, password, region, 0);
+}
+
+/** One attempt at login + fetch; retries transient failures with backoff. */
+function attemptFetch(email, password, region, attempt) {
+  function fail(message) {
+    if (attempt < FETCH_RETRY_DELAYS_MS.length && !isPermanentFetchError(message)) {
+      // Drop the cached token so the retry does a fresh login, in case
+      // the server stopped accepting it before its stated expiry
+      clearCachedToken();
+      setTimeout(function () {
+        attemptFetch(email, password, region, attempt + 1);
+      }, FETCH_RETRY_DELAYS_MS[attempt]);
+      return;
+    }
+    isDataFetchInProgress = false;
+    sendErrorToWatch(message);
+  }
 
   authenticateWithOkta(email, password, region,
     function (authError, accessToken, idToken, regionConfig) {
-      if (authError) {
-        isDataFetchInProgress = false;
-        sendErrorToWatch(authError);
-        return;
-      }
+      if (authError) { fail(authError); return; }
 
       fetchSleepRecords(accessToken, idToken, regionConfig,
         function (fetchError, sleepRecordItems) {
-          if (fetchError) {
-            // If we used a cached token and the API failed, the token
-            // might be stale — clear it and retry with fresh auth
-            var wasCached = !!getCachedToken();
-            clearCachedToken();
-            if (wasCached) {
-              isDataFetchInProgress = false;
-              fetchAndSendSleepData();
-              return;
-            }
-            isDataFetchInProgress = false;
-            sendErrorToWatch(fetchError);
-            return;
-          }
+          if (fetchError) { fail(fetchError); return; }
           isDataFetchInProgress = false;
           localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
           sendRecordsToWatch(sleepRecordItems);

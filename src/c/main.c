@@ -451,7 +451,7 @@ static void draw_header(GContext *ctx, GRect bounds, SleepRecord *record) {
 
         // Show day counter on right (e.g. "2/7")
         if (s_total_days > 1) {
-            static char day_counter[16];
+            static char day_counter[24];
             snprintf(day_counter, sizeof(day_counter), "%d/%d",
                      s_current_day_index + 1, s_total_days);
             graphics_draw_text(ctx, day_counter,

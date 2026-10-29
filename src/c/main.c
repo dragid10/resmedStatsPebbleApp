@@ -825,7 +825,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
             strstr(error_tuple->value->cstring, "log in") != NULL) {
             s_app_state = STATE_NO_CONFIG;
             s_last_sync_epoch = 0;
-            // Clear cached medical data from watch storage (Finding #12)
+            // Clear cached medical data from watch storage
             s_total_days = 0;
             memset(s_records, 0, sizeof(s_records));
             s_last_sync_time[0] = '\0';
@@ -948,7 +948,7 @@ static void inbox_received_handler(DictionaryIterator *iterator, void *context) 
                          tuple->value->cstring);
             }
 
-            // Clamp values to valid ranges to prevent int16_t truncation (Finding #13)
+            // Clamp values to valid ranges to prevent int16_t truncation
             tuple = dict_find(iterator, MESSAGE_KEY_SLEEP_SCORE);
             if (tuple) record->sleep_score = clamp_int16(tuple->value->int32, 0, 100);
 

@@ -85,7 +85,7 @@ var DEFAULT_REGION = 'NA';
 
 /**
  * Maximum credential length — reject inputs longer than this
- * to prevent memory issues and potential injection. (Finding #11)
+ * to prevent memory issues and potential injection.
  */
 var MAX_CREDENTIAL_LENGTH = 256;
 
@@ -123,7 +123,7 @@ var REGION_CONFIG = {
 // PebbleKit JS lacks crypto.getRandomValues(). We improve on raw
 // Math.random() by mixing multiple entropy sources through SHA-256.
 // This isn't a true CSPRNG but is significantly harder to predict
-// than raw Math.random() output. (Finding #2)
+// than raw Math.random() output.
 
 /** Counter incremented each time entropy is consumed. */
 var entropyCounter = 0;
@@ -221,7 +221,7 @@ function generateCodeChallenge(codeVerifier) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-Installation Device ID (Finding #9)
+// Per-Installation Device ID
 // ---------------------------------------------------------------------------
 // Generate a unique device UUID per installation to avoid correlating
 // all users under a single hardcoded rmdhandsetid.
@@ -282,7 +282,7 @@ function decodeBase64url(encoded) {
  * The country code is required for the GraphQL API's rmdcountry header.
  * Falls back to 'US' if the claim is missing or the token can't be decoded.
  *
- * Note: JWT signature is not verified (Finding #5 accepted risk —
+ * Note: JWT signature is not verified (accepted risk —
  * PebbleKit JS lacks the crypto primitives for JWKS verification).
  * The issuer is logged for debugging but not used as a gate.
  */
@@ -294,7 +294,7 @@ function extractCountryFromIdToken(idToken) {
     var payloadJson = decodeBase64url(jwtSegments[1]);
     var payload = JSON.parse(payloadJson);
 
-    // Log issuer for debugging (Finding #5)
+    // Log issuer for debugging
     if (payload.iss) {
     }
 
@@ -305,7 +305,7 @@ function extractCountryFromIdToken(idToken) {
 }
 
 // ---------------------------------------------------------------------------
-// HTML Escaping (Finding #8)
+// HTML Escaping
 // ---------------------------------------------------------------------------
 // Industry-standard approach: escape all characters that have special
 // meaning in HTML to prevent XSS when inserting user data into HTML strings.
@@ -326,7 +326,7 @@ function escapeHtml(str) {
 }
 
 // ---------------------------------------------------------------------------
-// Input Validation (Finding #11)
+// Input Validation
 // ---------------------------------------------------------------------------
 
 /** Basic email format validation. */
@@ -357,7 +357,6 @@ function isValidPassword(password) {
  * Make an HTTP request using XMLHttpRequest.
  * Note: TLS certificate pinning is not available in PebbleKit JS's
  * XMLHttpRequest implementation — this is an accepted platform limitation.
- * (Finding #7)
  */
 function makeHttpRequest(url, method, body, headers, callback) {
   var xhr = new XMLHttpRequest();
@@ -427,7 +426,7 @@ function processMessageQueue() {
 }
 
 // ---------------------------------------------------------------------------
-// Token Cache (Findings #1 and #14)
+// Token Cache
 // ---------------------------------------------------------------------------
 // Cache the access token and reuse it until it expires, reducing the number
 // of times credentials are sent to Okta. Also serves as partial mitigation
@@ -492,7 +491,7 @@ function authenticateWithOkta(email, password, region, interactive, callback) {
     return;
   }
 
-  // Try cached token first (Finding #14)
+  // Try cached token first
   var cached = getCachedToken();
   if (cached) {
     callback(null, cached.accessToken, cached.idToken, regionConfig);
@@ -707,7 +706,7 @@ function verifyMfaCode(code, callback) {
 /**
  * Watch-sized error for an Okta authn status we can't complete.
  * Names the status so user reports tell us what Okta asked for.
- * Finding #10: Don't instruct users to disable MFA.
+ * Don't instruct users to disable MFA.
  */
 function authnStatusMessage(status) {
   if (status && status.indexOf('MFA_') === 0) {
@@ -745,7 +744,7 @@ function exchangeSessionToken(sessionToken, regionConfig, callback) {
   var codeVerifier = generateCodeVerifier();
   var codeChallenge = generateCodeChallenge(codeVerifier);
 
-  // Generate and store state for CSRF validation (Finding #4)
+  // Generate and store state for CSRF validation
   var oauthState = generateOAuthState();
 
   var authorizeUrl = oktaBaseUrl + '/oauth2/' + authServerId + '/v1/authorize?' +
@@ -777,14 +776,14 @@ function exchangeSessionToken(sessionToken, regionConfig, callback) {
         authCodeMatch = responseBody.match(/"code"\s*:\s*"([^"]+)"/);
       }
       if (!authCodeMatch) {
-        // Finding #6: Don't log the response body
+        // Don't log the response body
         callback('Could not get auth code');
         return;
       }
 
       var authorizationCode = unescapeJsString(authCodeMatch[1]);
 
-      // Validate OAuth state to prevent CSRF (Finding #4)
+      // Validate OAuth state to prevent CSRF
       var stateMatch = responseBody.match(/data\.state\s*=\s*'([^']+)'/) ||
                        responseBody.match(/state=([^"&\s]+)/);
       if (stateMatch && unescapeJsString(stateMatch[1]) !== oauthState) {
@@ -810,7 +809,7 @@ function exchangeSessionToken(sessionToken, regionConfig, callback) {
         function (networkError, httpStatus, responseBody) {
           if (networkError) { callback('Token error'); return; }
           if (httpStatus !== 200) {
-            // Finding #6: Don't log response body — parse error safely
+            // Don't log response body — parse error safely
             var tokenErrMsg = 'Login failed. Try again.';
             try {
               var errData = JSON.parse(responseBody);
@@ -847,7 +846,7 @@ function handleTokenResponse(responseBody, regionConfig, callback) {
   if (tokenResponse.refresh_token) {
     localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, tokenResponse.refresh_token);
     // The refresh token replaces the password from here on, so don't keep
-    // it on the phone (Security audit finding #1)
+    // it on the phone
     localStorage.removeItem(STORAGE_KEY_PASSWORD);
   }
 
@@ -913,7 +912,7 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     'Authorization': 'Bearer ' + accessToken,
     'x-api-key': regionConfig.api_key,
     'Content-Type': 'application/json',
-    // TODO: Finding #9 — per-install UUID caused myAir:result errors,
+    // TODO: per-install UUID caused myAir:result errors,
     // needs further investigation. Using hardcoded ID for now.
     'rmdhandsetid': '02c1c662-c289-41fd-a9ae-196ff15b5166',
     'rmdlanguage': 'en',
@@ -1193,7 +1192,7 @@ Pebble.addEventListener('ready', function () {
 });
 
 Pebble.addEventListener('appmessage', function (event) {
-  // Finding #6: Don't log the full payload
+  // Don't log the full payload
 
   if (event.payload.FRESH_INSTALL !== undefined) {
     // Only clear credentials on fresh install if credentials haven't
@@ -1491,7 +1490,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
     if (typeof password === 'object' && password !== null) password = password.value;
     if (typeof region === 'object' && region !== null) region = region.value;
 
-    // Finding #11: Validate credentials before storing
+    // Validate credentials before storing
     if (email && !isValidEmail(email)) {
       sendErrorToWatch('Invalid email format');
       return;

@@ -63,6 +63,8 @@ var STORAGE_KEY_DEVICE_ID = 'resmed_device_id';
 var STORAGE_KEY_CONNECTED = 'resmed_connected';  // 'true' only after a successful data fetch
 var STORAGE_KEY_MFA = 'resmed_mfa_pending';       // JSON: email-code login waiting for a code
 var STORAGE_KEY_REFRESH_TOKEN = 'resmed_refresh_token';
+var STORAGE_KEY_API_CONFIG = 'resmed_api_config_';  // + region: JSON from ResMed's metadata
+var STORAGE_KEY_REGISTERED = 'resmed_registered_';  // + region: email|deviceId once registered
 
 /** Error that sends the watch to its "set up on your phone" screen. */
 var MSG_LOGIN_AGAIN = 'Open Settings to log in';
@@ -92,17 +94,17 @@ var MAX_CREDENTIAL_LENGTH = 256;
 // ---------------------------------------------------------------------------
 // Region Configuration
 // ---------------------------------------------------------------------------
-// Reverse-engineered from the myAir web app. Each region uses a separate
-// Okta tenant and AWS AppSync GraphQL endpoint.
-// Source: https://github.com/prestomation/resmed_myair_sensors
+// Each region uses a separate Okta tenant and myAir backend. The Okta
+// values are the public OAuth client of the myAir web app (PKCE, no client
+// secret). API endpoints and keys aren't hardcoded: like the web app, we read
+// them from the region's public metadata file (see getApiConfig).
 
 var REGION_CONFIG = {
   'NA': {
     okta_url: 'https://resmed-ext-1.okta.com',
     auth_server_id: 'aus4ccsxvnidQgLmA297',
     client_id: '0oa4ccq1v413ypROi297',
-    api_key: 'da2-cenztfjrezhwphdqtwtbpqvzui',
-    graphql_url: 'https://graphql.myair-prd.dht.live/graphql',
+    metadata_url: 'https://static.myair-prd.dht.live/v2/metadata.json?platform=Web&locale=en&product=myAir',
     redirect_url: 'https://myair.resmed.com',
     product: 'myAir'
   },
@@ -110,12 +112,14 @@ var REGION_CONFIG = {
     okta_url: 'https://id.resmed.eu',
     auth_server_id: 'aus2uznux2sYKTsEg417',
     client_id: '0oa2uz04d2Pks2NgR417',
-    api_key: 'da2-o66oo6xdnfh5hlfuw5yw5g2dtm',
-    graphql_url: 'https://graphql.hyperdrive.resmed.eu/graphql',
+    metadata_url: 'https://assets.hyperdrive.resmed.eu/v2/metadata.json?platform=Web&locale=en&product=myAir%20EU',
     redirect_url: 'https://myair.resmed.eu',
     product: 'myAir EU'
   }
 };
+
+/** Re-read the metadata file once a day; a cached copy is used if that fails. */
+var API_CONFIG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Entropy & PKCE — Improved PRNG for security-sensitive values
@@ -224,7 +228,8 @@ function generateCodeChallenge(codeVerifier) {
 // Per-Installation Device ID
 // ---------------------------------------------------------------------------
 // Generate a unique device UUID per installation to avoid correlating
-// all users under a single hardcoded rmdhandsetid.
+// all users under a single shared rmdhandsetid. Like the myAir web app, the
+// ID is registered with the account before use (see ensureDeviceRegistered).
 
 function getOrCreateDeviceId() {
   var deviceId = localStorage.getItem(STORAGE_KEY_DEVICE_ID);
@@ -883,6 +888,115 @@ function refreshAccessToken(refreshToken, regionConfig, callback) {
 // GraphQL — Fetch sleep records from the myAir AppSync API
 // ---------------------------------------------------------------------------
 
+/** The REGION_CONFIG key for a region's config object. */
+function regionKey(regionConfig) {
+  return regionConfig === REGION_CONFIG.EU ? 'EU' : 'NA';
+}
+
+/**
+ * Headers the myAir web app sends with every API call. The handset ID is
+ * this install's own ID, registered by ensureDeviceRegistered.
+ */
+function myAirHeaders(accessToken, idToken, regionConfig, apiKey) {
+  return {
+    'Authorization': 'Bearer ' + accessToken,
+    'x-api-key': apiKey,
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'rmdhandsetid': getOrCreateDeviceId(),
+    'rmdlanguage': 'en',
+    'rmdhandsetmodel': 'Chrome',
+    'rmdhandsetosversion': '131.0.0.0',
+    'rmdproduct': regionConfig.product,
+    'rmdappversion': '1.0.0',
+    'rmdhandsetplatform': 'Web',
+    'rmdcountry': extractCountryFromIdToken(idToken),
+    'accept-language': 'en-US,en;q=0.9'
+  };
+}
+
+/** Read a cached metadata config: { config, fresh } or null. */
+function getCachedApiConfig(region) {
+  try {
+    var cached = JSON.parse(localStorage.getItem(STORAGE_KEY_API_CONFIG + region));
+    if (cached && cached.appSyncUrl && cached.appSyncApiKey &&
+        cached.restUrl && cached.restApiKey) {
+      return { config: cached, fresh: Date.now() - (cached.fetchedAt || 0) < API_CONFIG_MAX_AGE_MS };
+    }
+  } catch (e) { /* unreadable cache: refetch */ }
+  return null;
+}
+
+/**
+ * Get the region's API endpoints and keys from ResMed's public metadata file
+ * (no login needed; the web app loads the same file). Cached for a day, and
+ * a stale copy is used if the file can't be fetched.
+ * Calls back with (error, { appSyncUrl, appSyncApiKey, restUrl, restApiKey }).
+ */
+function getApiConfig(regionConfig, callback) {
+  var region = regionKey(regionConfig);
+  var cached = getCachedApiConfig(region);
+  if (cached && cached.fresh) { callback(null, cached.config); return; }
+
+  function useCacheOr(message) {
+    if (cached) { callback(null, cached.config); return; }
+    callback(message);
+  }
+
+  makeHttpRequest(regionConfig.metadata_url, 'GET', null, null,
+    function (networkError, httpStatus, responseBody) {
+      if (networkError) { useCacheOr('Network error'); return; }
+      if (httpStatus !== 200) { useCacheOr('Metadata error (' + httpStatus + ')'); return; }
+      var info;
+      try { info = JSON.parse(responseBody).instanceInfo; } catch (e) { info = null; }
+      if (!info || !info.appSyncUrl || !info.appSyncApiKey || !info.restUrl || !info.restApiKey) {
+        useCacheOr('Bad metadata response');
+        return;
+      }
+      var config = {
+        appSyncUrl: info.appSyncUrl,
+        appSyncApiKey: info.appSyncApiKey,
+        restUrl: info.restUrl,
+        restApiKey: info.restApiKey,
+        fetchedAt: Date.now()
+      };
+      localStorage.setItem(STORAGE_KEY_API_CONFIG + region, JSON.stringify(config));
+      callback(null, config);
+    });
+}
+
+/**
+ * Register this install's handset ID with the myAir account, once per
+ * account and region, the way the web app does for each new browser. An
+ * unregistered ID makes the API answer with errors. A failed registration
+ * doesn't block the fetch: it's tried again next time.
+ */
+function ensureDeviceRegistered(accessToken, idToken, regionConfig, apiConfig, email, callback) {
+  var markerKey = STORAGE_KEY_REGISTERED + regionKey(regionConfig);
+  var marker = email + '|' + getOrCreateDeviceId();
+  if (localStorage.getItem(markerKey) === marker) { callback(); return; }
+
+  makeHttpRequest(apiConfig.restUrl + '/V1/Patient/RegisterApplication', 'POST', '{}',
+    myAirHeaders(accessToken, idToken, regionConfig, apiConfig.restApiKey),
+    function (networkError, httpStatus) {
+      if (!networkError && httpStatus >= 200 && httpStatus < 300) {
+        localStorage.setItem(markerKey, marker);
+      } else {
+        console.log('Device registration failed: ' + (networkError || httpStatus));
+      }
+      callback();
+    });
+}
+
+/** Forget device registrations (logout, fresh install). */
+function clearDeviceRegistrations() {
+  for (var region in REGION_CONFIG) {
+    if (REGION_CONFIG.hasOwnProperty(region)) {
+      localStorage.removeItem(STORAGE_KEY_REGISTERED + region);
+    }
+  }
+}
+
 function formatIsoDate(date) {
   var year = date.getFullYear();
   var month = ('0' + (date.getMonth() + 1)).slice(-2);
@@ -890,9 +1004,7 @@ function formatIsoDate(date) {
   return year + '-' + month + '-' + day;
 }
 
-function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
-  var countryCode = extractCountryFromIdToken(idToken);
-  var deviceId = getOrCreateDeviceId();
+function fetchSleepRecords(accessToken, idToken, regionConfig, apiConfig, callback) {
 
   var today = new Date();
   var rangeStart = new Date(today.getTime() - MAX_DAYS * MS_PER_DAY);
@@ -908,28 +1020,12 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
     'items { startDate totalUsage sleepScore ahi maskPairCount leakPercentile __typename } ' +
     '__typename } __typename } }';
 
-  var requestHeaders = {
-    'Authorization': 'Bearer ' + accessToken,
-    'x-api-key': regionConfig.api_key,
-    'Content-Type': 'application/json',
-    // TODO: per-install UUID caused myAir:result errors,
-    // needs further investigation. Using hardcoded ID for now.
-    'rmdhandsetid': '02c1c662-c289-41fd-a9ae-196ff15b5166',
-    'rmdlanguage': 'en',
-    'rmdhandsetmodel': 'Chrome',
-    'rmdhandsetosversion': '131.0.0.0',
-    'rmdproduct': regionConfig.product,
-    'rmdappversion': '1.0.0',
-    'rmdhandsetplatform': 'Web',
-    'rmdcountry': countryCode,
-    'accept-language': 'en-US,en;q=0.9'
-  };
-
+  var requestHeaders = myAirHeaders(accessToken, idToken, regionConfig,
+    apiConfig.appSyncApiKey);
   var requestBody = JSON.stringify({ query: graphqlQuery });
 
-
   makeHttpRequest(
-    regionConfig.graphql_url,
+    apiConfig.appSyncUrl,
     'POST',
     requestBody,
     requestHeaders,
@@ -954,6 +1050,9 @@ function fetchSleepRecords(accessToken, idToken, regionConfig, callback) {
           callback(MSG_NO_DEVICE);
           return;
         }
+        // Register the device again on the next attempt, in case ResMed
+        // dropped the registration
+        localStorage.removeItem(STORAGE_KEY_REGISTERED + regionKey(regionConfig));
         var errType = apiResponse.errors[0] ? apiResponse.errors[0].errorType || apiResponse.errors[0].message || 'unknown' : 'unknown';
         callback('API error: ' + errType.substring(0, 40));
         return;
@@ -1130,15 +1229,24 @@ function attemptFetch(email, password, region, attempt, generation, interactive)
       if (authError) { fail(authError); return; }
       if (isAbandoned()) return;
 
-      fetchSleepRecords(accessToken, idToken, regionConfig,
-        function (fetchError, sleepRecordItems) {
-          if (fetchError) { fail(fetchError); return; }
-          if (isAbandoned()) return;
-          isDataFetchInProgress = false;
-          localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
-          sendRecordsToWatch(sleepRecordItems);
-        }
-      );
+      getApiConfig(regionConfig, function (configError, apiConfig) {
+        if (configError) { fail(configError); return; }
+        if (isAbandoned()) return;
+
+        ensureDeviceRegistered(accessToken, idToken, regionConfig, apiConfig, email,
+          function () {
+            if (isAbandoned()) return;
+            fetchSleepRecords(accessToken, idToken, regionConfig, apiConfig,
+              function (fetchError, sleepRecordItems) {
+                if (fetchError) { fail(fetchError); return; }
+                if (isAbandoned()) return;
+                isDataFetchInProgress = false;
+                localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
+                sendRecordsToWatch(sleepRecordItems);
+              }
+            );
+          });
+      });
     }
   );
 }
@@ -1217,6 +1325,7 @@ Pebble.addEventListener('appmessage', function (event) {
       clearCachedToken();
       clearRefreshToken();
       clearPendingMfa();
+      clearDeviceRegistrations();
     }
   }
 
@@ -1420,6 +1529,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
       clearCachedToken();
       clearRefreshToken();
       clearPendingMfa();
+      clearDeviceRegistrations();
       sendErrorToWatch('Open Settings to log in');
       return;
     }

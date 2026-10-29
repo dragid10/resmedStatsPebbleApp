@@ -1,6 +1,7 @@
 {
   "name": "resmedStatsPebbleApp",
   "author": "dragid10",
+  "license": "MIT",
   "version": "1.2.0",
   "keywords": ["pebble-app"],
   "private": true,

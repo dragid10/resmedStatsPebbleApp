@@ -100,3 +100,7 @@ The API is undocumented and may change without notice. This app is not affiliate
 ## Disclaimer
 
 This application is **not HIPAA compliant and does not intend to be**. CPAP therapy data is cached on the watch and transmitted over Bluetooth without application-layer encryption. This app is intended for personal use — it is not a medical device and should not be used for clinical decision-making.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

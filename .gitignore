@@ -1,7 +1,7 @@
 build/
 node_modules/
 screenshot_*.png
-.lock-waf_linux_build
+.lock-waf_*
 
 # OS and editor artifacts
 .DS_Store

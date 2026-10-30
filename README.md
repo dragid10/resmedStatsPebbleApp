@@ -93,7 +93,9 @@ This app uses the unofficial ResMed myAir API, reverse-engineered from the myAir
 1. POST credentials to Okta `/api/v1/authn` to get a session token
 2. Exchange session token for an authorization code via OAuth2 PKCE
 3. Exchange the authorization code for access and ID tokens
-4. Query the AWS AppSync GraphQL endpoint for sleep records
+4. Read the region's public myAir metadata file for the API endpoints and keys (cached for a day)
+5. Register this install's own random handset ID with the account, once, as the myAir web app does for each browser
+6. Query the AWS AppSync GraphQL endpoint for sleep records
 
 The API is undocumented and may change without notice. This app is not affiliated with or endorsed by ResMed.
 

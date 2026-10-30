@@ -688,3 +688,159 @@ test('an expired code challenge is deleted from storage', function () {
   assert.equal(env.app.getPendingMfa(), null);
   assert.equal(env.storage.resmed_mfa_pending, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// API metadata and device registration
+// ---------------------------------------------------------------------------
+
+/** Cached token, but no cached metadata and no registered device. */
+function unregisteredStorage(extra) {
+  var storage = h.withCachedToken(extra);
+  delete storage.resmed_device_id;
+  delete storage.resmed_api_config_NA;
+  delete storage.resmed_registered_NA;
+  return storage;
+}
+
+function graphqlRoute() {
+  return { match: /graphql/, respond: function () {
+    return h.graphqlOk([h.sleepRecord('2026-10-24')]);
+  } };
+}
+
+test('a new install reads the metadata, registers its own handset ID, then fetches', function () {
+  var env = h.loadApp({ storage: unregisteredStorage(), routes: [graphqlRoute()] });
+  env.app.fetchAndSendSleepData();
+
+  assert.deepEqual(urlsHit(env),
+    ['/v2/metadata.json', '/V1/Patient/RegisterApplication', '/graphql']);
+  var deviceId = env.storage.resmed_device_id;
+  assert.match(deviceId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+  var register = env.requests[1];
+  assert.equal(register.url, 'https://rest.NA.example/V1/Patient/RegisterApplication');
+  assert.equal(register.method, 'POST');
+  assert.equal(register.headers['x-api-key'], 'rest-key-NA');
+  assert.equal(register.headers.rmdhandsetid, deviceId);
+  assert.equal(register.headers.Authorization, 'Bearer cached-token');
+
+  var graphql = env.requests[2];
+  assert.equal(graphql.url, 'https://appsync.NA.example/graphql');
+  assert.equal(graphql.headers['x-api-key'], 'appsync-key-NA');
+  assert.equal(graphql.headers.rmdhandsetid, deviceId);
+
+  assert.equal(env.storage.resmed_registered_NA, 'alex@example.com|' + deviceId);
+  assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+});
+
+test('two installs get different handset IDs', function () {
+  var ids = [1, 2].map(function () {
+    var env = h.loadApp({ storage: unregisteredStorage(), routes: [graphqlRoute()] });
+    env.app.fetchAndSendSleepData();
+    return env.storage.resmed_device_id;
+  });
+  assert.notEqual(ids[0], ids[1]);
+});
+
+test('the EU region reads the EU metadata file', function () {
+  var storage = unregisteredStorage({ resmed_region: 'EU' });
+  delete storage.resmed_api_config_EU;
+  delete storage.resmed_registered_EU;
+  var env = h.loadApp({ storage: storage, routes: [graphqlRoute()] });
+  env.app.fetchAndSendSleepData();
+  assert.match(env.requests[0].url, /^https:\/\/assets\.hyperdrive\.resmed\.eu\/.*product=myAir%20EU$/);
+  assert.equal(env.requests[2].url, 'https://appsync.EU.example/graphql');
+  assert.ok(env.storage.resmed_registered_EU);
+});
+
+test('metadata older than a day is read again', function () {
+  var stale = JSON.parse(h.apiConfig('NA'));
+  stale.fetchedAt = Date.now() - 25 * 60 * 60 * 1000;
+  var env = h.loadApp({
+    storage: h.withCachedToken({ resmed_api_config_NA: JSON.stringify(stale) }),
+    routes: [graphqlRoute()]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(urlsHit(env), ['/v2/metadata.json', '/graphql']);
+  assert.ok(JSON.parse(env.storage.resmed_api_config_NA).fetchedAt > stale.fetchedAt);
+});
+
+test('if the metadata file is unreachable, a stale copy is used', function () {
+  var stale = JSON.parse(h.apiConfig('NA'));
+  stale.fetchedAt = 0;
+  var env = h.loadApp({
+    storage: h.withCachedToken({ resmed_api_config_NA: JSON.stringify(stale) }),
+    routes: [{ match: /metadata/, respond: function () { return { status: 503 }; } }, graphqlRoute()]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(urlsHit(env), ['/v2/metadata.json', '/graphql']);
+  assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+});
+
+test('with no metadata at all, the fetch retries and then reports the error', function () {
+  var env = h.loadApp({
+    storage: unregisteredStorage(),
+    routes: [{ match: /metadata/, respond: function () { return { error: 'network' }; } }]
+  });
+  env.app.fetchAndSendSleepData();
+  env.runTimers();
+  assert.deepEqual(urlsHit(env),
+    ['/v2/metadata.json', '/v2/metadata.json', '/v2/metadata.json']);
+  assert.deepEqual(env.errorsSent(), ['Network error']);
+});
+
+test('a failed registration still fetches and is tried again next time', function () {
+  var registerStatus = 500;
+  var env = h.loadApp({
+    storage: unregisteredStorage(),
+    routes: [{ match: /RegisterApplication/, respond: function () {
+      return { status: registerStatus, body: '{}' };
+    } }, graphqlRoute()]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+  assert.equal(env.storage.resmed_registered_NA, undefined);
+
+  registerStatus = 200;
+  var before = env.requests.length;
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(urlsHit({ requests: env.requests.slice(before) }),
+    ['/V1/Patient/RegisterApplication', '/graphql']);
+  assert.ok(env.storage.resmed_registered_NA);
+});
+
+test('a GraphQL error makes the retry register the device again', function () {
+  var calls = 0;
+  var env = h.loadApp({
+    storage: h.withCachedToken(),
+    routes: [{ match: /graphql/, respond: function () {
+      calls++;
+      if (calls === 1) {
+        return { status: 200, body: JSON.stringify({ errors: [{ errorType: 'myAir:result' }] }) };
+      }
+      return h.graphqlOk([h.sleepRecord('2026-10-24')]);
+    } }]
+  });
+  env.app.fetchAndSendSleepData();
+  env.runTimers();
+  assert.deepEqual(urlsHit(env),
+    ['/graphql', '/V1/Patient/RegisterApplication', '/graphql']);
+  assert.deepEqual(plain(env.sent[env.sent.length - 1]), { DATA_COMPLETE: 1 });
+});
+
+test('logging in to a different account registers the device for it', function () {
+  var env = h.loadApp({
+    storage: h.withCachedToken({ resmed_email: 'other@example.com' }),
+    routes: [graphqlRoute()]
+  });
+  env.app.fetchAndSendSleepData();
+  assert.deepEqual(urlsHit(env), ['/V1/Patient/RegisterApplication', '/graphql']);
+  assert.equal(env.storage.resmed_registered_NA, 'other@example.com|' + h.DEVICE_ID);
+});
+
+test('disconnecting forgets device registrations', function () {
+  var env = h.loadApp({ storage: h.withCachedToken({ resmed_connected: 'true' }) });
+  closeWith(env, { Logout: true });
+  assert.equal(env.storage.resmed_registered_NA, undefined);
+  assert.equal(env.storage.resmed_registered_EU, undefined);
+});

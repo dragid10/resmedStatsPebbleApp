@@ -36,7 +36,8 @@ function loadApp(options) {
   var sentMessages = [];
   var requests = [];
   var timers = [];
-  var routes = options.routes || [];
+  // Tests' own routes win; metadata and device registration just succeed
+  var routes = (options.routes || []).concat(defaultRoutes());
   var localStorage = createLocalStorage(options.storage);
 
   function FakeXHR() {
@@ -130,6 +131,24 @@ function loadApp(options) {
 
 // -- Canned ResMed responses --
 
+/** ResMed's public metadata file for a region, as getApiConfig reads it. */
+function metadataOk(region) {
+  var config = JSON.parse(apiConfig(region));
+  delete config.fetchedAt;
+  return { status: 200, body: JSON.stringify({ instanceInfo: config }) };
+}
+
+function defaultRoutes() {
+  return [
+    { match: /\/v2\/metadata\.json\?/, respond: function (req) {
+      return metadataOk(/resmed\.eu/.test(req.url) ? 'EU' : 'NA');
+    } },
+    { match: /\/V1\/Patient\/RegisterApplication$/, respond: function () {
+      return { status: 200, body: '{}' };
+    } }
+  ];
+}
+
 function sleepRecord(startDate, overrides) {
   return Object.assign({
     startDate: startDate, totalUsage: 425, sleepScore: 88,
@@ -160,10 +179,32 @@ function oktaLoginRoutes() {
   ];
 }
 
+var DEVICE_ID = '11111111-2222-4333-8444-555555555555';
+
+/** What getApiConfig stores after reading a region's metadata file. */
+function apiConfig(region) {
+  return JSON.stringify({
+    appSyncUrl: 'https://appsync.' + region + '.example/graphql',
+    appSyncApiKey: 'appsync-key-' + region,
+    restUrl: 'https://rest.' + region + '.example',
+    restApiKey: 'rest-key-' + region,
+    fetchedAt: Date.now()
+  });
+}
+
+/**
+ * Logged-in storage. API metadata is cached and the device is already
+ * registered in both regions, so most tests see only login and GraphQL calls.
+ */
 var CREDENTIALS = {
   resmed_email: 'alex@example.com',
   resmed_password: 'hunter2',
-  resmed_region: 'NA'
+  resmed_region: 'NA',
+  resmed_device_id: DEVICE_ID,
+  resmed_api_config_NA: apiConfig('NA'),
+  resmed_api_config_EU: apiConfig('EU'),
+  resmed_registered_NA: 'alex@example.com|' + DEVICE_ID,
+  resmed_registered_EU: 'alex@example.com|' + DEVICE_ID
 };
 
 /** Credentials plus a cached token valid for another hour. */
@@ -181,5 +222,8 @@ module.exports = {
   graphqlOk: graphqlOk,
   oktaLoginRoutes: oktaLoginRoutes,
   CREDENTIALS: CREDENTIALS,
+  DEVICE_ID: DEVICE_ID,
+  apiConfig: apiConfig,
+  metadataOk: metadataOk,
   withCachedToken: withCachedToken
 };

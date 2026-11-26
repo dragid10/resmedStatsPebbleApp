@@ -19,6 +19,52 @@
     "capabilities": [
       "configurable"
     ],
+    "usesPermissions": [
+      {
+        "name": "Internet",
+        "parameters": {
+          "domains": [
+            "myair.resmed.com",
+            "resmed-ext-1.okta.com",
+            "static.myair-prd.dht.live",
+            "myair.resmed.eu",
+            "id.resmed.eu",
+            "hyperdrive.resmed.eu"
+          ]
+        },
+        "reason": "To sign in to myAir and get your sleep stats",
+        "required": true
+      }
+    ],
+    "plugin": {
+      "description": "CPAP sleep stats from ResMed myAir, as fetched by the ResMed Stats app: one instance per night, newest first (instances[0] is last night), with sleep score (0-100), AHI (events an hour), usage (minutes), mask-off count and leak (%). Updated when the ResMed Stats app syncs, about once a day.",
+      "script": "src/plugin/index.js",
+      "definesPermissions": [
+        {
+          "name": "ReadSleepStats",
+          "label": "Read your CPAP sleep stats",
+          "kind": "read"
+        }
+      ],
+      "sources": [
+        {
+          "category": "health",
+          "items": ["cpap"],
+          "properties": {
+            "name": ["shortText", "longText"],
+            "night": ["timestamp"],
+            "sleep_score": ["numericValue", "shortText", "longText"],
+            "ahi": ["numericValue", "shortText", "longText"],
+            "usage": ["numericValue", "shortText", "longText"],
+            "mask_off": ["numericValue", "shortText", "longText"],
+            "leak": ["numericValue", "shortText", "longText"]
+          },
+          "supportsMultiple": true,
+          "callerPermissions": ["ReadSleepStats"],
+          "suggestedRefreshIntervalSec": 3600
+        }
+      ]
+    },
     "targetPlatforms": [
       "aplite",
       "basalt",

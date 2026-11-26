@@ -65,6 +65,10 @@ var STORAGE_KEY_MFA = 'resmed_mfa_pending';       // JSON: email-code login wait
 var STORAGE_KEY_REFRESH_TOKEN = 'resmed_refresh_token';
 var STORAGE_KEY_API_CONFIG = 'resmed_api_config_';  // + region: JSON from ResMed's metadata
 var STORAGE_KEY_REGISTERED = 'resmed_registered_';  // + region: email|deviceId once registered
+// Nights the plugin (src/plugin/index.js) serves to other watchfaces and apps.
+// localStorage is shared between this PKJS and the plugin.
+var STORAGE_KEY_PLUGIN_NIGHTS = 'plugin_nights';
+var PLUGIN_SOURCE = 'health/cpap';
 
 /** Error that sends the watch to its "set up on your phone" screen. */
 var MSG_LOGIN_AGAIN = 'Open Settings to log in';
@@ -1088,6 +1092,35 @@ function formatDateForWatch(isoDateString) {
   }
 }
 
+/**
+ * Keep the nights for the plugin, newest first, so any watchface or app can
+ * show them (see src/plugin/index.js). Only the numbers the watch shows are kept.
+ */
+function savePluginNights(records) {
+  var nights = records.map(function (record) {
+    return {
+      date: (record.startDate || '').split('T')[0],
+      sleepScore: record.sleepScore || 0,
+      ahi: record.ahi || 0,
+      usage: record.totalUsage || 0,
+      maskOff: record.maskPairCount || 0,
+      leak: record.leakPercentile || 0
+    };
+  });
+  localStorage.setItem(STORAGE_KEY_PLUGIN_NIGHTS,
+    JSON.stringify({ fetchedAt: Date.now(), nights: nights }));
+  if (typeof Pebble.refreshSources === 'function') {
+    try { Pebble.refreshSources([PLUGIN_SOURCE]); } catch (e) { /* older Pebble app */ }
+  }
+}
+
+function clearPluginNights() {
+  localStorage.removeItem(STORAGE_KEY_PLUGIN_NIGHTS);
+  if (typeof Pebble.refreshSources === 'function') {
+    try { Pebble.refreshSources([PLUGIN_SOURCE]); } catch (e) { /* older Pebble app */ }
+  }
+}
+
 function sendRecordsToWatch(sleepRecordItems) {
   sleepRecordItems.sort(function (a, b) {
     return (b.startDate || '').localeCompare(a.startDate || '');
@@ -1095,6 +1128,7 @@ function sendRecordsToWatch(sleepRecordItems) {
 
   var recordsToSend = sleepRecordItems.slice(0, MAX_DAYS);
   var totalDays = recordsToSend.length;
+  savePluginNights(recordsToSend);
 
 
   enqueueWatchMessage({ 'TOTAL_DAYS': totalDays });
@@ -1326,6 +1360,7 @@ Pebble.addEventListener('appmessage', function (event) {
       clearRefreshToken();
       clearPendingMfa();
       clearDeviceRegistrations();
+      clearPluginNights();
     }
   }
 
@@ -1530,6 +1565,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
       clearRefreshToken();
       clearPendingMfa();
       clearDeviceRegistrations();
+      clearPluginNights();
       sendErrorToWatch('Open Settings to log in');
       return;
     }

@@ -83,10 +83,12 @@ test('the plugin keeps the newest-first order and honours limit', function () {
   assert.equal(plugin.request({ category: 'health', item: 'cpap', limit: 1 }).data.instances.length, 1);
 });
 
-test('the plugin serves no nights before the first sync or after bad data', function () {
-  assert.deepEqual(loadPlugin({}).request({ category: 'health', item: 'cpap' }).data.instances, []);
-  assert.deepEqual(loadPlugin({ plugin_nights: '{not json' })
-    .request({ category: 'health', item: 'cpap' }).data.instances, []);
+test('before the first sync (or with bad data) the plugin says how to get data', function () {
+  [{}, { plugin_nights: '{not json' }, nights([])].forEach(function (storage) {
+    var out = loadPlugin(storage).request({ category: 'health', item: 'cpap' });
+    assert.equal(out.error, 'PLUGIN_UNAVAILABLE');
+    assert.match(out.message, /Open ResMed Stats/);
+  });
 });
 
 test('the plugin refuses sources it does not serve', function () {
@@ -158,4 +160,46 @@ test('the plugin guards its source with its own read permission', function () {
   var plugin = pkg.pebble.plugin;
   assert.deepEqual(plugin.definesPermissions.map(function (p) { return p.name; }), ['ReadSleepStats']);
   assert.deepEqual(plugin.sources[0].callerPermissions, ['ReadSleepStats']);
+});
+
+test('a request the Pebble app blocks asks the user to allow Internet instead of retrying', function () {
+  var env = h.loadApp({ storage: h.withCachedToken(), routes: [{ match: /graphql/, respond: function () {
+    return { error: 'network' };
+  } }] });
+  env.app.Pebble.permissions = { query: function (name) {
+    assert.equal(name, 'Internet/resmed-ext-1.okta.com');
+    return { then: function (ok) { ok('denied'); } };
+  } };
+  env.emit('appmessage', { payload: { REQUEST_DATA: 1 } });
+  assert.deepEqual(env.errorsSent(), ['Allow Internet for ResMed Stats in the Pebble app']);
+  var msg = env.app.MSG_ALLOW_INTERNET;
+  assert.ok(msg.length <= 60 && msg.indexOf('Settings') === -1 && msg.indexOf('log in') === -1);
+});
+
+test('a real network error with Internet allowed still retries', function () {
+  var env = h.loadApp({ storage: h.withCachedToken(), routes: [{ match: /graphql/, respond: function () {
+    return { error: 'network' };
+  } }] });
+  env.app.Pebble.permissions = { query: function () { return { then: function (ok) { ok('granted'); } }; } };
+  env.emit('appmessage', { payload: { REQUEST_DATA: 1 } });
+  var delays = env.runTimers();
+  assert.ok(delays.indexOf(5000) !== -1, 'retried with backoff: ' + delays);
+  assert.deepEqual(env.errorsSent(), ['Network error']);
+});
+
+test('the settings page explains the plugin on Pebble apps that have plugins', function () {
+  var env = h.loadApp({ storage: h.withCachedToken(Object.assign({ resmed_connected: 'true' },
+    nights([NIGHT]))) });
+  env.app.Pebble.subscribeToSource = function () {};
+  env.emit('showConfiguration');
+  var page = decodeURIComponent(env.app.Pebble.openedUrl);
+  assert.match(page, /On Other Watchfaces/);
+  assert.match(page, /Read your CPAP sleep stats/);
+  assert.match(page, /Sharing 1 night/);
+});
+
+test('older Pebble apps get no plugin card', function () {
+  var env = h.loadApp({ storage: h.withCachedToken({ resmed_connected: 'true' }) });
+  env.emit('showConfiguration');
+  assert.doesNotMatch(decodeURIComponent(env.app.Pebble.openedUrl || ''), /On Other Watchfaces/);
 });

@@ -87,9 +87,15 @@ Pebble.registerSourceHandler(function (request, respond) {
     respond.error('INVALID_REQUEST', 'ResMed Stats serves health/cpap only.');
     return;
   }
+  var list = instances(request.limit);
+  if (!list.length) {
+    // Apps show this instead of an empty reading
+    respond.error('PLUGIN_UNAVAILABLE', 'Open ResMed Stats on your watch to sign in and sync.');
+    return;
+  }
   respond.data({
     validUntilMs: Date.now() + REFRESH_MS,
-    instances: instances(request.limit)
+    instances: list
   });
 });
 

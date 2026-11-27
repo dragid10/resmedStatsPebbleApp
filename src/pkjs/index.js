@@ -65,6 +65,10 @@ var STORAGE_KEY_MFA = 'resmed_mfa_pending';       // JSON: email-code login wait
 var STORAGE_KEY_REFRESH_TOKEN = 'resmed_refresh_token';
 var STORAGE_KEY_API_CONFIG = 'resmed_api_config_';  // + region: JSON from ResMed's metadata
 var STORAGE_KEY_REGISTERED = 'resmed_registered_';  // + region: email|deviceId once registered
+// Nights the plugin (src/plugin/index.js) serves to other watchfaces and apps.
+// localStorage is shared between this PKJS and the plugin.
+var STORAGE_KEY_PLUGIN_NIGHTS = 'plugin_nights';
+var PLUGIN_SOURCE = 'health/cpap';
 
 /** Error that sends the watch to its "set up on your phone" screen. */
 var MSG_LOGIN_AGAIN = 'Open Settings to log in';
@@ -78,6 +82,9 @@ var MSG_CODE_SENT = 'Code emailed. Enter it in the phone app';
 var MSG_CODE_NEEDED = 'Code needed. Open the phone app';
 var MSG_CODE_WRONG = 'Wrong code. Try again in the phone app';
 var MSG_CODE_EXPIRED = 'Code expired. Open the phone app';
+// The user turned off (or hasn't yet answered) Internet for this app in the
+// Pebble app. No "Settings" or "log in" here: those make the watch wipe its data.
+var MSG_ALLOW_INTERNET = 'Allow Internet for ResMed Stats in the Pebble app';
 
 /** Fallback lifetime of an Okta MFA transaction if it doesn't say. */
 var MFA_DEFAULT_LIFETIME_MS = 5 * 60 * 1000;
@@ -1088,6 +1095,35 @@ function formatDateForWatch(isoDateString) {
   }
 }
 
+/**
+ * Keep the nights for the plugin, newest first, so any watchface or app can
+ * show them (see src/plugin/index.js). Only the numbers the watch shows are kept.
+ */
+function savePluginNights(records) {
+  var nights = records.map(function (record) {
+    return {
+      date: (record.startDate || '').split('T')[0],
+      sleepScore: record.sleepScore || 0,
+      ahi: record.ahi || 0,
+      usage: record.totalUsage || 0,
+      maskOff: record.maskPairCount || 0,
+      leak: record.leakPercentile || 0
+    };
+  });
+  localStorage.setItem(STORAGE_KEY_PLUGIN_NIGHTS,
+    JSON.stringify({ fetchedAt: Date.now(), nights: nights }));
+  if (typeof Pebble.refreshSources === 'function') {
+    try { Pebble.refreshSources([PLUGIN_SOURCE]); } catch (e) { /* older Pebble app */ }
+  }
+}
+
+function clearPluginNights() {
+  localStorage.removeItem(STORAGE_KEY_PLUGIN_NIGHTS);
+  if (typeof Pebble.refreshSources === 'function') {
+    try { Pebble.refreshSources([PLUGIN_SOURCE]); } catch (e) { /* older Pebble app */ }
+  }
+}
+
 function sendRecordsToWatch(sleepRecordItems) {
   sleepRecordItems.sort(function (a, b) {
     return (b.startDate || '').localeCompare(a.startDate || '');
@@ -1095,6 +1131,7 @@ function sendRecordsToWatch(sleepRecordItems) {
 
   var recordsToSend = sleepRecordItems.slice(0, MAX_DAYS);
   var totalDays = recordsToSend.length;
+  savePluginNights(recordsToSend);
 
 
   enqueueWatchMessage({ 'TOTAL_DAYS': totalDays });
@@ -1198,6 +1235,33 @@ function fetchAndSendSleepData(restart) {
   attemptFetch(email, password, region, 0, fetchGeneration, !!restart);
 }
 
+/**
+ * Whether the Pebble app lets this app reach the region's sign-in host.
+ * Calls back true when it can't tell (older Pebble app, no answer).
+ */
+function internetAllowed(region, callback) {
+  var regionConfig = REGION_CONFIG[region] || REGION_CONFIG[DEFAULT_REGION];
+  var done = false;
+  function answer(allowed) {
+    if (done) return;
+    done = true;
+    callback(allowed);
+  }
+  if (!Pebble.permissions || typeof Pebble.permissions.query !== 'function') {
+    answer(true);
+    return;
+  }
+  setTimeout(function () { answer(true); }, 2000);
+  try {
+    var host = regionConfig.okta_url.replace(/^https:\/\//, '').replace(/\/.*$/, '');
+    Pebble.permissions.query('Internet/' + host).then(function (state) {
+      answer(state === 'granted');
+    }, function () { answer(true); });
+  } catch (e) {
+    answer(true);
+  }
+}
+
 /** One attempt at login + fetch; retries transient failures with backoff. */
 function attemptFetch(email, password, region, attempt, generation, interactive) {
   function isAbandoned() {
@@ -1207,6 +1271,18 @@ function attemptFetch(email, password, region, attempt, generation, interactive)
 
   function fail(message) {
     if (isAbandoned()) return;
+    if (message === 'Network error' && !fail.checked) {
+      // A request the Pebble app blocked looks like a network error here;
+      // ask it before retrying something that can't work
+      fail.checked = true;
+      internetAllowed(region, function (allowed) {
+        if (isAbandoned()) return;
+        if (allowed) { fail(message); return; }
+        isDataFetchInProgress = false;
+        sendErrorToWatch(MSG_ALLOW_INTERNET);
+      });
+      return;
+    }
     if (message === MSG_NO_DEVICE || message === 'No CPAP data found') {
       // The login itself worked; don't send the user back to the login form
       localStorage.setItem(STORAGE_KEY_CONNECTED, 'true');
@@ -1326,6 +1402,7 @@ Pebble.addEventListener('appmessage', function (event) {
       clearRefreshToken();
       clearPendingMfa();
       clearDeviceRegistrations();
+      clearPluginNights();
     }
   }
 
@@ -1374,6 +1451,28 @@ function buildMfaCodePage(codeSent) {
 /**
  * Settings page — shows different content based on login state.
  */
+/**
+ * Settings card explaining the plugin, on Pebble apps that have plugins.
+ * Plain text only: the page can't open the Pebble app's own screens.
+ */
+function pluginCard() {
+  if (typeof Pebble.subscribeToSource !== 'function') return '';
+  var saved = null;
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY_PLUGIN_NIGHTS) || 'null'); } catch (e) { saved = null; }
+  var nights = saved && saved.nights ? saved.nights.length : 0;
+  var status = nights
+    ? 'Sharing ' + nights + (nights === 1 ? ' night' : ' nights') + ', last synced ' +
+      escapeHtml(new Date(saved.fetchedAt).toLocaleString()) + '.'
+    : 'Nothing to share yet. Your stats appear here after the first sync.';
+  return '<div class="card">' +
+    '<h3>On Other Watchfaces</h3>' +
+    '<div class="setting-desc">Watchfaces and apps that support Pebble plugins can show your ' +
+    'sleep score and other stats. They ask first: allow &ldquo;Read your CPAP sleep stats&rdquo; ' +
+    'when the Pebble app asks. To add your sleep score to a watchface&rsquo;s complications, ' +
+    'pick it in the Pebble app under Settings, Plugins, Complications.</div>' +
+    '<div class="setting-desc" style="margin-top:8px;">' + status + '</div></div>';
+}
+
 Pebble.addEventListener('showConfiguration', function () {
   var savedEmail = localStorage.getItem(STORAGE_KEY_EMAIL);
   var isConnected = localStorage.getItem(STORAGE_KEY_CONNECTED) === 'true';
@@ -1472,6 +1571,7 @@ Pebble.addEventListener('showConfiguration', function () {
       '<div class="setting-row"><div class="setting-label">Leak</div>' +
       '<label class="toggle"><input type="checkbox" id="show-leak"' +
       (showLeak ? ' checked' : '') + '><span class="slider"></span></label></div></div>' +
+      pluginCard() +
 
       '<button class="btn btn-save" onclick="saveSettings()">Save Settings</button>' +
       '<button class="btn btn-danger" onclick="disconnect()">Disconnect Account</button>' +
@@ -1530,6 +1630,7 @@ Pebble.addEventListener('webviewclosed', function (event) {
       clearRefreshToken();
       clearPendingMfa();
       clearDeviceRegistrations();
+      clearPluginNights();
       sendErrorToWatch('Open Settings to log in');
       return;
     }

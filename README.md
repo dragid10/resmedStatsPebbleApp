@@ -15,6 +15,7 @@ A Pebble smartwatch app that connects to your ResMed myAir account and displays 
 - **Automatic background sync** via configurable interval (4/6/8/12 hours)
 - **Cached data** — app launches instantly with stored data, only fetches when stale
 - **Phone settings page** with login, logout, and configurable options
+- **Show your stats on any watchface** — a built-in [Pebble plugin](https://developer.repebble.com/guides/plugins/preview/) shares the nights it fetched with other watchfaces and apps (Pebble app 2.0 or later)
 
 ## Settings (via phone companion)
 
@@ -44,6 +45,7 @@ After logging in, the settings page offers:
 - Nothing is sent to any cloud service or external server beyond ResMed's own API
 - The watch stores only sleep data (scores, stats) — never credentials
 - Uninstalling the app clears all stored data
+- The plugin shares only the sleep stats (never credentials), and only with apps you allow to "Read your CPAP sleep stats". Logging out removes them
 
 ## How It Works
 
@@ -56,6 +58,22 @@ Phone (PebbleKit JS)              Watch (C)
 ```
 
 The phone companion handles all authentication and API communication. The watch only receives and displays the resulting sleep data.
+
+### Plugin for other watchfaces and apps
+
+After each sync the phone companion saves the nights for the plugin (`src/plugin/index.js`), which serves them as the `health/cpap` source: one instance per night, newest first, so `instances[0]` is last night. Each has `sleep_score` (0-100), `ahi` (events an hour), `usage` (minutes), `mask_off`, `leak` (%), `name` ("Oct 24") and `night` (timestamp). Numbers come as `numericValue` and `shortText`/`longText`. The plugin never signs in or goes online itself, so its data updates when the app syncs (at least once a day).
+
+```js
+Pebble.subscribeToSource({
+  category: 'health', item: 'cpap', properties: ['sleep_score'],
+  onData: function (update) {
+    var lastNight = update.instances[0];
+    if (lastNight) console.log(lastNight.properties.sleep_score.shortText.text);
+  }
+});
+```
+
+Callers need the plugin's `ReadSleepStats` permission (declare it in `usesPermissions` with this app's uuid, `d607a5ed-bb8b-41ee-ace2-10db69f73b46`).
 
 ## Supported Platforms
 
